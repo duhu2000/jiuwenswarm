@@ -350,3 +350,40 @@ def test_replaced_session_cannot_finalize(flow):
 def test_endpoint_validation(value):
     with pytest.raises(oauth.OAuthError):
         oauth._endpoint(value)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"access_token": None},
+        {"access_token": ""},
+        {"access_token": "bad\nheader"},
+        {"access_token": "bad\rheader"},
+        {"refresh_token": None},
+        {"refresh_token": ""},
+        {"token_type": "Basic"},
+        {"expires_in": "3600"},
+        {"expires_in": True},
+        {"expires_in": 0},
+        {"expires_in": -1},
+        {"scope": "other"},
+        {"scope": None},
+    ],
+)
+def test_invalid_token_metadata_never_creates_a_grant(flow, override):
+    manager, provider = flow
+
+    def invalid_provider(request):
+        response = provider(request)
+        if request.url.path == "/oauth/token":
+            return httpx.Response(200, json={**response.json(), **override})
+        return response
+
+    manager.transport = httpx.MockTransport(invalid_provider)
+    response, query = start(manager)
+    result = callback(query)
+    assert result.status_code == 400
+    assert "bad" not in result.text
+    with pytest.raises(oauth.OAuthError):
+        manager.wait(NAME, response["oauth_session"])
+    assert not manager.grant(NAME)

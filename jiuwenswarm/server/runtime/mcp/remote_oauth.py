@@ -50,14 +50,11 @@ def _endpoint(value: object) -> str:
     if not isinstance(value, str):
         raise OAuthError("OAuth endpoint is missing.")
     parsed = urlsplit(value)
-    if (
-        parsed.scheme != "https"
-        or parsed.netloc != "agent.qcc.com"
-        or parsed.username
-        or parsed.password
-        or parsed.fragment
-        or parsed.query
-    ):
+    if parsed.scheme != "https" or parsed.netloc != "agent.qcc.com":
+        raise OAuthError("OAuth endpoint is outside the trusted issuer.")
+    if parsed.username or parsed.password:
+        raise OAuthError("OAuth endpoint is outside the trusted issuer.")
+    if parsed.fragment or parsed.query:
         raise OAuthError("OAuth endpoint is outside the trusted issuer.")
     return value
 
@@ -136,15 +133,13 @@ class RemoteOAuthManager:
             return {}
         try:
             grant = json.loads(raw)
-            if (
-                grant["resource"] != QCC_RESOURCE
-                or grant["issuer"] != QCC_ISSUER
-                or not isinstance(grant["client_id"], str)
-                or not isinstance(grant.get("expires_at"), (int, float))
-                or not isinstance(grant.get("access_token"), str)
-                or not isinstance(grant.get("refresh_token"), str)
-            ):
+            if grant["resource"] != QCC_RESOURCE or grant["issuer"] != QCC_ISSUER:
                 raise ValueError
+            if not isinstance(grant.get("expires_at"), (int, float)):
+                raise TypeError
+            for key in ("client_id", "access_token", "refresh_token"):
+                if not isinstance(grant.get(key), str):
+                    raise TypeError
             _endpoint(grant["token_endpoint"])
             _endpoint(grant["revocation_endpoint"])
             return grant
@@ -161,7 +156,8 @@ class RemoteOAuthManager:
         if self.store.get_token(name + "-oauth", GRANT_KEY) != raw:
             raise OAuthError("Could not save OAuth credentials. Reconnect.")
 
-    def _discover(self, client: httpx.Client) -> dict:
+    @staticmethod
+    def _discover(client: httpx.Client) -> dict:
         resource = _json_response(client.get(QCC_METADATA))
         if resource.get("resource") != QCC_RESOURCE or resource.get(
             "authorization_servers"
@@ -190,20 +186,19 @@ class RemoteOAuthManager:
         access = data.get("access_token")
         refresh = data.get("refresh_token")
         lifetime = data.get("expires_in")
-        if (
-            not isinstance(access, str)
-            or not access
-            or "\n" in access
-            or "\r" in access
-            or not isinstance(refresh, str)
-            or not refresh
-            or str(data.get("token_type", "")).lower() != "bearer"
-            or not isinstance(lifetime, (int, float))
-            or isinstance(lifetime, bool)
-            or not math.isfinite(lifetime)
-            or lifetime <= 0
-        ):
-            raise OAuthError("OAuth server returned invalid token metadata.")
+        invalid = "OAuth server returned invalid token metadata."
+        if not isinstance(access, str) or not access:
+            raise OAuthError(invalid)
+        if "\n" in access or "\r" in access:
+            raise OAuthError(invalid)
+        if not isinstance(refresh, str) or not refresh:
+            raise OAuthError(invalid)
+        if str(data.get("token_type", "")).lower() != "bearer":
+            raise OAuthError(invalid)
+        if not isinstance(lifetime, (int, float)) or isinstance(lifetime, bool):
+            raise OAuthError(invalid)
+        if not math.isfinite(lifetime) or lifetime <= 0:
+            raise OAuthError(invalid)
         scope = data.get("scope", "mcp:tools")
         if not isinstance(scope, str) or "mcp:tools" not in scope.split():
             raise OAuthError("OAuth authorization did not grant MCP access.")
@@ -214,6 +209,72 @@ class RemoteOAuthManager:
             "expires_at": time.time() + lifetime,
             "scope": scope,
         }
+
+    def complete_authorization(
+        self,
+        name: str,
+        pending: PendingAuthorization,
+        query: dict,
+        registration: dict,
+    ) -> str:
+        """Exchange and store one validated callback, sanitizing provider errors."""
+        meta = registration
+        client_id = registration["client_id"]
+        redirect_uri = registration["redirect_uri"]
+        error = ""
+        grant = None
+        try:
+            if query.get("error"):
+                raise OAuthError("Authorization was denied. Retry when ready.")
+            if len(query.get("code", [])) != 1 or not query["code"][0]:
+                raise OAuthError("Authorization code is missing.")
+            with self._client() as client:
+                response = client.post(
+                    meta["token_endpoint"],
+                    data={
+                        "grant_type": "authorization_code",
+                        "client_id": client_id,
+                        "code": query["code"][0],
+                        "redirect_uri": redirect_uri,
+                        "code_verifier": pending.verifier,
+                        "resource": QCC_RESOURCE,
+                    },
+                )
+                grant = self._tokens(
+                    _json_response(response),
+                    {
+                        "client_id": client_id,
+                        "resource": QCC_RESOURCE,
+                        "issuer": QCC_ISSUER,
+                        "oauth_session": pending.id,
+                        "token_endpoint": meta["token_endpoint"],
+                        "revocation_endpoint": meta["revocation_endpoint"],
+                    },
+                )
+            with pending.lock:
+                if pending.done.is_set():
+                    raise OAuthError("Authorization was cancelled or expired.")
+                with self._grant_lock(name):
+                    try:
+                        previous = self.grant(name)
+                    except OAuthError:
+                        previous = {}
+                    self._save(name, grant)
+                pending.done.set()
+            if previous:
+                self._revoke(previous)
+        except Exception:  # noqa: BLE001 — sanitize provider/IO errors at the credential boundary
+            # Never expose provider responses/exceptions with a code/token.
+            error = "Authorization failed, was cancelled, or expired. Please reconnect."
+            if grant:
+                self._revoke(grant)
+            with pending.lock:
+                pending.error = error
+                pending.done.set()
+        finally:
+            pending.verifier = ""
+            pending.close_listener()
+        return error
 
     def begin(self, name: str) -> dict:
         self._check_name(name)
@@ -230,7 +291,8 @@ class RemoteOAuthManager:
                 def log_message(self, *_args):
                     pass  # request URL contains the one-time authorization code
 
-                def do_GET(self):
+                # BaseHTTPRequestHandler dispatch requires this exact method name.
+                def do_GET(self):  # pylint: disable=huawei-invalid-name
                     parsed = urlsplit(self.path)
                     query = parse_qs(parsed.query, keep_blank_values=True)
                     expected_host = f"127.0.0.1:{self.server.server_port}"
@@ -248,63 +310,12 @@ class RemoteOAuthManager:
                             self.reply(409, "Authorization has already finished.")
                             return
                         pending.consumed = True
-                    error = ""
-                    grant = None
-                    try:
-                        if query.get("error"):
-                            raise OAuthError(
-                                "Authorization was denied. Retry when ready."
-                            )
-                        if len(query.get("code", [])) != 1 or not query["code"][0]:
-                            raise OAuthError("Authorization code is missing.")
-                        with manager._client() as client:
-                            response = client.post(
-                                meta["token_endpoint"],
-                                data={
-                                    "grant_type": "authorization_code",
-                                    "client_id": client_id,
-                                    "code": query["code"][0],
-                                    "redirect_uri": redirect_uri,
-                                    "code_verifier": pending.verifier,
-                                    "resource": QCC_RESOURCE,
-                                },
-                            )
-                            grant = manager._tokens(
-                                _json_response(response),
-                                {
-                                    "client_id": client_id,
-                                    "resource": QCC_RESOURCE,
-                                    "issuer": QCC_ISSUER,
-                                    "oauth_session": pending.id,
-                                    "token_endpoint": meta["token_endpoint"],
-                                    "revocation_endpoint": meta["revocation_endpoint"],
-                                },
-                            )
-                        with pending.lock:
-                            if pending.done.is_set():
-                                raise OAuthError(
-                                    "Authorization was cancelled or expired."
-                                )
-                            with manager._grant_lock(name):
-                                try:
-                                    previous = manager.grant(name)
-                                except OAuthError:
-                                    previous = {}
-                                manager._save(name, grant)
-                            pending.done.set()
-                        if previous:
-                            manager._revoke(previous)
-                    except Exception:  # noqa: BLE001 — sanitize provider/IO errors at the credential boundary
-                        # Never expose provider responses/exceptions with a code/token.
-                        error = "Authorization failed, was cancelled, or expired. Please reconnect."
-                        if grant:
-                            manager._revoke(grant)
-                        with pending.lock:
-                            pending.error = error
-                            pending.done.set()
-                    finally:
-                        pending.verifier = ""
-                        pending.close_listener()
+                    error = manager.complete_authorization(
+                        name,
+                        pending,
+                        query,
+                        {**meta, "client_id": client_id, "redirect_uri": redirect_uri},
+                    )
                     self.reply(
                         400 if error else 200,
                         error
@@ -431,12 +442,9 @@ class RemoteOAuthManager:
         """Called only after the live MCP probe. Cancelled flows cannot connect."""
         with self.lock:
             pending = self.pending.get(name)
-            if (
-                not pending
-                or pending.id != session
-                or pending.error
-                or not pending.done.is_set()
-            ):
+            if not pending or pending.id != session:
+                raise OAuthError("Authorization was cancelled or replaced. Reconnect.")
+            if pending.error or not pending.done.is_set():
                 raise OAuthError("Authorization was cancelled or replaced. Reconnect.")
             pending.finalized = True
 

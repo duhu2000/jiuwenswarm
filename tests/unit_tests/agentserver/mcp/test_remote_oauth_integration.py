@@ -228,3 +228,30 @@ def test_cancel_does_not_remove_newer_or_finished_connection(setup):
     assert get_mcp_record(NAME)
     registry.cancel_remote_oauth(NAME, manager.pending[NAME].id)
     assert get_mcp_record(NAME)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signal", [KeyboardInterrupt, SystemExit])
+async def test_process_control_exceptions_propagate_after_cleanup(
+    setup, monkeypatch, signal
+):
+    from openjiuwen.core.runner.resources_manager.tool_manager import ToolMgr
+
+    from jiuwenswarm.common.mcp_config import build_mcp_server_config
+
+    manager, _, _ = setup
+    authorize(manager)
+    client = ToolMgr._create_client(build_mcp_server_config(registry.connect_mcp(NAME)))
+    cleaned = []
+
+    def interrupted_client(**_kwargs):
+        raise signal()
+
+    async def disconnect():
+        cleaned.append(True)
+
+    monkeypatch.setattr(httpx, "AsyncClient", interrupted_client)
+    monkeypatch.setattr(client, "disconnect", disconnect)
+    with pytest.raises(signal):
+        await client.connect()
+    assert cleaned == [True]

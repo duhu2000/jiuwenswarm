@@ -68,7 +68,8 @@ class OAuthStreamableHttpClient(StreamableHttpClient):
                 "OAuth MCP connection failed. Check authorization and retry."
             )
             await self.disconnect()
-            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            # Process-control exceptions must propagate after cleanup.
+            if not isinstance(exc, (Exception, asyncio.CancelledError)):
                 raise
             if (
                 isinstance(exc, asyncio.CancelledError)
