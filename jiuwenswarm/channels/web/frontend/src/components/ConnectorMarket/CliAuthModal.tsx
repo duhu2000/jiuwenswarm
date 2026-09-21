@@ -35,9 +35,21 @@ export function CliAuthModal({ name, initial, onCancel, onConnected }: CliAuthMo
   const [justAdvanced, setJustAdvanced] = useState(false);
   const requestSeqRef = useRef(0);
   const [retrySeq, setRetrySeq] = useState(0);
+  const mountedRef = useRef(false);
+  const finishedRef = useRef(false);
+  const remoteSessionRef = useRef(step.oauthSession);
+  remoteSessionRef.current = step.oauthSession;
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
+      // Defer one microtask so StrictMode's setup/cleanup/setup is not a cancel.
+      queueMicrotask(() => {
+        if (!mountedRef.current && !finishedRef.current && remoteSessionRef.current) {
+          void useConnectorStore.getState().cancelOAuth(name, remoteSessionRef.current);
+        }
+      });
       // 组件卸载后让 in-flight 的 waitAuth 结果失效，避免用户关掉弹窗后过很久收到的
       // connected/失败还去 setStep/setStatus（这个 promise 本身取消不了，只能靠序号丢弃结果）。
       requestSeqRef.current += 1;
@@ -53,7 +65,7 @@ export function CliAuthModal({ name, initial, onCancel, onConnected }: CliAuthMo
     const seq = ++requestSeqRef.current;
     setStatus('waiting');
     setErrorMessage(null);
-    waitAuth(name, step.stepIndex ?? 0).then((response) => {
+    waitAuth(name, step.stepIndex ?? 0, step.oauthSession).then((response) => {
       if (seq !== requestSeqRef.current) return; // 已卸载/已发起新一轮，丢弃过期结果
       if (!response) {
         setStatus('error');
@@ -61,6 +73,7 @@ export function CliAuthModal({ name, initial, onCancel, onConnected }: CliAuthMo
         return;
       }
       if (response.type === 'connected') {
+        finishedRef.current = true;
         onConnected();
         return;
       }
@@ -81,7 +94,19 @@ export function CliAuthModal({ name, initial, onCancel, onConnected }: CliAuthMo
     if (step.authUrl) window.open(step.authUrl, '_blank', 'noopener,noreferrer');
   }
 
-  function handleRetry() {
+  async function handleCancel() {
+    requestSeqRef.current += 1;
+    if (step.oauthSession) await useConnectorStore.getState().cancelOAuth(name, step.oauthSession);
+    finishedRef.current = true;
+    onCancel();
+  }
+
+  async function handleRetry() {
+    if (step.oauthSession) {
+      const response = await useConnectorStore.getState().connect(name, 'oauth');
+      if (response?.type === 'auth_required') setStep(response);
+      return;
+    }
     setJustAdvanced(false);
     setRetrySeq((v) => v + 1);
   }
@@ -100,7 +125,7 @@ export function CliAuthModal({ name, initial, onCancel, onConnected }: CliAuthMo
   return createPortal(
     <div data-connector-auth-modal="true" data-testid="connector-market-cli-auth-modal" className="fixed inset-0 z-[10100] flex items-center justify-center bg-overlay-cron-dialog">
       <div className="relative w-[420px] rounded-2xl bg-card p-6 shadow-xl">
-        <button type="button" onClick={onCancel} className="absolute right-5 top-5 text-text-muted hover:text-text" data-testid="connector-market-cli-auth-modal-close">
+        <button type="button" onClick={handleCancel} className="absolute right-5 top-5 text-text-muted hover:text-text" data-testid="connector-market-cli-auth-modal-close">
           <X size={18} />
         </button>
 
