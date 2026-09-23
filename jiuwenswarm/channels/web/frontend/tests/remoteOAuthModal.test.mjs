@@ -8,12 +8,13 @@ import { createRoot } from 'react-dom/client';
 import { JSDOM } from 'jsdom';
 
 let ConnectTokenModal;
+let CliAuthModal;
 before(async () => {
   const root = fileURLToPath(new URL('../', import.meta.url));
   const dir = `${root}node_modules/.cache/remote-oauth-modal`;
   await mkdir(dir, { recursive: true });
   await build({
-    entryPoints: [`${root}src/components/ConnectorMarket/ConnectTokenModal.tsx`],
+    stdin: { contents: "export { ConnectTokenModal } from './src/components/ConnectorMarket/ConnectTokenModal'; export { CliAuthModal } from './src/components/ConnectorMarket/CliAuthModal';", resolveDir: root, loader: 'tsx' },
     outfile: `${dir}/modal.mjs`, bundle: true, packages: 'external', platform: 'node', format: 'esm',
     plugins: [{ name: 'test-boundaries', setup(b) {
       b.onResolve({ filter: /stores\/connectorStore$/ }, () => ({ path: 'store', namespace: 'mock' }));
@@ -28,7 +29,7 @@ before(async () => {
       }[path] }));
     }}],
   });
-  ({ ConnectTokenModal } = await import(pathToFileURL(`${dir}/modal.mjs`)));
+  ({ ConnectTokenModal, CliAuthModal } = await import(pathToFileURL(`${dir}/modal.mjs`)));
 });
 
 function deferred() {
@@ -37,7 +38,7 @@ function deferred() {
   return { promise, resolve };
 }
 
-async function mount(available = true) {
+async function mount(available = true, cli = false) {
   const dom = new JSDOM('<div id="root"></div>', { url: 'http://localhost/' });
   const previous = new Map();
   for (const [key, value] of Object.entries({ window: dom.window, document: dom.window.document,
@@ -45,17 +46,19 @@ async function mount(available = true) {
     previous.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
     Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
   }
-  const calls = { connect: [], wait: [], cancel: [], open: [], connected: 0, closed: 0 };
+  const calls = { connect: [], wait: [], cancel: [], cancelConnect: [], open: [], connected: 0, closed: 0 };
   const waiting = deferred();
   window.open = (...args) => { calls.open.push(args); };
   globalThis.__oauthStore = {
     connect: async (...args) => { calls.connect.push(args); return { type: 'auth_required', oauthSession: 'session-1', authUrl: 'https://agent.qcc.com/oauth/authorize?state=test', stepIndex: 0 }; },
     waitAuth: (...args) => { calls.wait.push(args); return waiting.promise; },
+    cancelConnectAction: async (...args) => { calls.cancelConnect.push(args); },
     cancelOAuth: async (...args) => { calls.cancel.push(args); },
     saveCredentialsAndConnect: async () => ({ type: 'connected' }),
   };
   const root = createRoot(document.getElementById('root'));
-  await act(async () => root.render(React.createElement(ConnectTokenModal, {
+  await act(async () => root.render(React.createElement(cli ? CliAuthModal : ConnectTokenModal, {
+    initial: { type: 'auth_required', authUrl: 'https://example.com/auth', stepIndex: 0 },
     name: 'qcc-company', displayName: '企查查',
     response: { type: 'credentials_required', oauthAvailable: available, requiredTokens: ['QICHACHA_API_KEY'], fields: { QICHACHA_API_KEY: { type: 'password' } } },
     onConnected: () => { calls.connected++; }, onCancel: () => { calls.closed++; },
@@ -107,11 +110,12 @@ test('API Key fallback remains available and other connectors keep their origina
   } finally { await view.cleanup(); }
 });
 
-test('closing authorization cancels the backend flow and ignores late completion', async () => {
+for (const button of ['cli-auth-modal-close', 'cli-auth-modal-cancel']) {
+test(`cancelling authorization via ${button} ignores late completion`, async () => {
   const view = await mount();
   try {
     await view.click('oauth-connect');
-    await view.click('cli-auth-modal-close');
+    await view.click(button);
     assert.deepEqual(view.calls.cancel, [['qcc-company', 'session-1']]);
     assert.ok(view.byId('oauth-connect'));
     await act(async () => view.waiting.resolve({ type: 'connected' }));
@@ -119,9 +123,24 @@ test('closing authorization cancels the backend flow and ignores late completion
   } finally { await view.cleanup(); }
 });
 
+}
+
 test('navigating away cancels a pending remote authorization', async () => {
   const view = await mount();
   await view.click('oauth-connect');
   await view.cleanup();
   assert.deepEqual(view.calls.cancel, [['qcc-company', 'session-1']]);
+});
+
+
+test('ordinary CLI authorization keeps the upstream cancel path and ignores late completion', async () => {
+  const view = await mount(false, true);
+  try {
+    await view.click('cli-auth-modal-cancel');
+    assert.deepEqual(view.calls.cancelConnect, [['qcc-company']]);
+    assert.deepEqual(view.calls.cancel, []);
+    await act(async () => view.waiting.resolve({ type: 'connected' }));
+    assert.equal(view.calls.connected, 0);
+    assert.equal(view.calls.closed, 1);
+  } finally { await view.cleanup(); }
 });

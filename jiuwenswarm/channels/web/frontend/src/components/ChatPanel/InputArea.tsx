@@ -88,11 +88,13 @@ import { useDesktopLocalFilePickerReady } from '../../hooks';
 import { useAdaptiveTooltip } from '../../hooks/useAdaptiveTooltip';
 import { getInputProjectOptions, isDefaultInputProject } from './projectSelection';
 import {
+  canRetryAttachmentDraft,
   DESKTOP_CLIPBOARD_IMAGES_EVENT,
   getClipboardImageFiles,
   inspectClipboardImageFiles,
   IMAGE_INPUT_DISABLED_ALERT_KEY,
   isImageInputDisabled,
+  resolveImageMimeType,
   shouldAlertImagePasteDisabled,
   type DesktopClipboardImagesEventDetail,
 } from './clipboardImagePaste';
@@ -164,6 +166,7 @@ import {
 import { ContextUsageIndicator } from './ContextUsageIndicator';
 import { isImeCompositionKey } from './imeComposition';
 import { useTaskAsr } from '../../features/taskAsr/useTaskAsr';
+import { useTaskAsrEnabled } from '../../features/taskAsr/featureFlag';
 import { ApplicationPluginTaskInputActions } from '../../applicationPlugins/ApplicationPluginOutlet';
 
 /** 输入栏下拉所需的最小技能数据结构（与 SkillPanel 中的 SkillItem 保持一致） */
@@ -178,7 +181,7 @@ type InputAreaSkillItem = {
   enabled?: boolean;
   installed?: boolean;
   tags?: string[];
-  skill_type?: 'skill' | 'swarm_skill' | 'multimodal_skill';
+  skill_type?: 'skill' | 'skillpack' | 'swarm_skill' | 'multimodal_skill';
 };
 
 type SlashCommandMeta = {
@@ -251,7 +254,10 @@ function getComposerSuggestionItems(
       }));
     const skills = slashSkills
       .filter((skill) =>
-        isTeamMode ? skill.skill_type === 'swarm_skill' : !skill.skill_type || skill.skill_type === 'skill',
+        // 单 agent：普通 skill + skillpack（技能包可当普通技能选用）；集群：swarm_skill。
+        isTeamMode
+          ? skill.skill_type === 'swarm_skill'
+          : !skill.skill_type || skill.skill_type === 'skill' || skill.skill_type === 'skillpack',
       )
       .filter((skill) => {
         if (!query) return true;
@@ -465,6 +471,13 @@ interface AttachmentDraft {
   /** Absolute local path from desktop native picker (WebView2 has no File.path). */
   localPath?: string;
 }
+
+// ChatPanel/InputArea is unmounted when navigating between some conversation
+// surfaces (notably an existing session and the new-conversation page). Keep
+// unsent attachment drafts at module scope so that navigation does not discard
+// a session's composer state. The persisted image itself already lives under
+// that session's uploads directory; this map preserves only the pending UI draft.
+const attachmentDraftsBySession = new Map<string, AttachmentDraft[]>();
 
 interface AttachmentAlert {
   id: string;
@@ -689,9 +702,12 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   },
   ref,
 ) {
+  const activeSessionId = useChatStore((s) => s.activeSessionId);
   const [speechError, setSpeechError] = useState('');
   const [isModeMenuOpen, setIsModeMenuOpen] = useState(false);
-  const [attachments, setAttachments] = useState<AttachmentDraft[]>([]);
+  const [attachments, setAttachments] = useState<AttachmentDraft[]>(() =>
+    activeSessionId ? (attachmentDraftsBySession.get(activeSessionId) ?? []) : [],
+  );
   const [attachmentAlerts, setAttachmentAlerts] = useState<AttachmentAlert[]>([]);
   const attachmentAlertTimersRef = useRef<Map<string, number>>(new Map());
   const [attachmentMenuId, setAttachmentMenuId] = useState<string | null>(null);
@@ -781,7 +797,6 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const attachmentMenuOpenedByLongPressRef = useRef(false);
   const isComposingRef = useRef(false);
   const { t, i18n } = useTranslation();
-  const activeSessionId = useChatStore((s) => s.activeSessionId);
   const agentGroupUnavailable = useChatStore(
     (s) => s.runtimes[activeSessionId ?? '']?.agentGroupUnavailable ?? false,
   );
@@ -969,10 +984,10 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const planPendingExplicitEntry = usePlanStore(
     (s) => s.runtimes[activeSessionId ?? '']?.pendingExplicitEntry ?? false,
   );
-  // 个人上下文：agent 加载开关（总开关联动）。总开关关闭时整个菜单项隐藏；开启时默认打开，可单独控制。
+  // 个人上下文：agent 加载开关（总开关联动）。总开关关闭时整个菜单项隐藏；开启时可单独控制。
   const isConnected = useSessionStore((s) => s.isConnected);
   const personalContextMasterEnabled = usePersonalContextStore(
-    (s) => s.config.collection_enabled || s.config.agent_use_enabled,
+    (s) => s.config.master_enabled ?? (s.config.collection_enabled || s.config.agent_use_enabled),
   );
   const agentUseEnabled = usePersonalContextStore((s) => s.config.agent_use_enabled);
   const agentUsePending = usePersonalContextStore((s) => !!s.pendingWrites.agent_use_enabled);
@@ -1180,6 +1195,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     onTranscript: appendTaskAsrTranscript,
     onError: setSpeechError,
   });
+  const taskAsrEnabled = useTaskAsrEnabled();
 
   const imageInputDisabled = isImageInputDisabled({
     isListening: isListening || isTranscribing,
@@ -1250,7 +1266,20 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   }, []);
 
   const updateAttachment = useCallback((id: string, update: Partial<AttachmentDraft>) => {
-    setAttachments((prev) => prev.map((item) => (item.id === id ? { ...item, ...update } : item)));
+    setAttachments((prev) => {
+      if (prev.some((item) => item.id === id)) {
+        return prev.map((item) => (item.id === id ? { ...item, ...update } : item));
+      }
+      for (const [sessionId, drafts] of attachmentDraftsBySession) {
+        if (!drafts.some((item) => item.id === id)) continue;
+        attachmentDraftsBySession.set(
+          sessionId,
+          drafts.map((item) => (item.id === id ? { ...item, ...update } : item)),
+        );
+        break;
+      }
+      return prev;
+    });
   }, []);
 
   const removeAttachment = useCallback((id: string) => {
@@ -1264,6 +1293,23 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     setAttachmentMenuId(null);
     clearAttachmentAlertTimers(attachmentAlertTimersRef.current);
   }, []);
+
+  const attachmentSessionIdRef = useRef(activeSessionId);
+  useEffect(() => {
+    const sessionId = attachmentSessionIdRef.current;
+    if (sessionId) attachmentDraftsBySession.set(sessionId, attachments);
+  }, [attachments]);
+
+  useEffect(() => {
+    if (attachmentSessionIdRef.current === activeSessionId) return;
+    const previousSessionId = attachmentSessionIdRef.current;
+    if (previousSessionId) attachmentDraftsBySession.set(previousSessionId, attachments);
+    attachmentSessionIdRef.current = activeSessionId;
+    setAttachments(activeSessionId ? (attachmentDraftsBySession.get(activeSessionId) ?? []) : []);
+    setAttachmentAlerts([]);
+    setAttachmentMenuId(null);
+    clearAttachmentAlertTimers(attachmentAlertTimersRef.current);
+  }, [activeSessionId, attachments]);
 
   const stopAttachmentMenuTimer = useCallback(() => {
     if (attachmentMenuTimerRef.current) {
@@ -1474,7 +1520,15 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
   const retryAttachment = useCallback(
     (attachment: AttachmentDraft) => {
-      uploadAttachment(attachment);
+      if (attachment.kind !== 'image') {
+        uploadAttachment(attachment);
+        return;
+      }
+      const mimeType = resolveImageMimeType(attachment.filename, attachment.mimeType);
+      const previewUrl = attachment.base64Data
+        ? `data:${mimeType};base64,${attachment.base64Data}`
+        : attachment.previewUrl;
+      uploadAttachment({ ...attachment, mimeType, previewUrl });
     },
     [uploadAttachment],
   );
@@ -1513,7 +1567,10 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           id: makeAttachmentId(file),
           kind,
           filename: file.name || (kind === 'document' ? `document-${Date.now()}` : `image-${Date.now()}`),
-          mimeType: file.type || 'application/octet-stream',
+          mimeType:
+            kind === 'image'
+              ? resolveImageMimeType(file.name || '', file.type)
+              : file.type || 'application/octet-stream',
           size: file.size,
           file,
           ...(localPath ? { localPath } : {}),
@@ -1598,18 +1655,22 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           return items;
         }
 
+        const mimeType =
+          pick.kind === 'image'
+            ? resolveImageMimeType(pick.filename, pick.mime_type)
+            : pick.mime_type || 'application/octet-stream';
         const draft: AttachmentDraft = {
           id: `${pick.filename}-${pick.size}-${generateUuidV4()}`,
           kind: pick.kind,
           filename: pick.filename,
-          mimeType: pick.mime_type || 'application/octet-stream',
+          mimeType,
           size: pick.size,
           localPath: pick.path,
           status: 'uploading',
           ...(pick.kind === 'image' && pick.base64
             ? {
                 base64Data: pick.base64,
-                previewUrl: `data:${pick.mime_type || 'application/octet-stream'};base64,${pick.base64}`,
+                previewUrl: `data:${mimeType};base64,${pick.base64}`,
               }
             : {}),
         };
@@ -1714,6 +1775,9 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       // 下面任何 ref 的子树内——靠 data-connector-auth-modal 识别“点的是弹窗内部”，跳过关闭（与
       // ExtensionPickerPanel.tsx 的同款监听一致；bug 2026091001-001 portal 化后的回归修复）。
       if ((event.target as HTMLElement | null)?.closest?.('[data-connector-auth-modal]')) return;
+      // Select 下拉面板同样门户挂到 body（data-select-panel），点选单位等选项时不视为外部点击，
+      // 否则配置面板先于选项 click 卸载，选择丢失
+      if ((event.target as HTMLElement | null)?.closest?.('[data-select-panel]')) return;
       if (
         !attachMenuRef.current?.contains(event.target as Node) &&
         !attachMenuPortalRef.current?.contains(event.target as Node) &&
@@ -3160,7 +3224,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                               >
                                 {t('chat.uploadFailed')}
                               </span>
-                              {attachment.file && (
+                              {canRetryAttachmentDraft(attachment) && (
                                 <button
                                   type="button"
                                   className="chat-input-attachment-retry"
@@ -4080,13 +4144,12 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                     <button
                       type="button"
                       className="chat-agent-tag__close"
-                      title={t('chat.agentRemove')}
                       aria-label={t('chat.agentRemove')}
                       onClick={() => {
                         if (activeSessionId) setAgentSelectionIntent(activeSessionId, { kind: 'clear' });
                       }}
                     >
-                      <X size={16} strokeWidth={2.5} aria-hidden="true" />
+                      <WorkIcon name="close" />
                     </button>
                   </div>
                 )}
@@ -4130,15 +4193,14 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                       <button
                         type="button"
                         className="chat-agent-tag__close"
-                        title={t('chat.agentGroupRemove')}
                         aria-label={t('chat.agentGroupRemove')}
                         data-testid="chat-panel-agent-group-tag-close"
-                        onClick={() => {
-                          if (activeSessionId) clearAgentGroupSelectionIntent(activeSessionId);
-                        }}
-                      >
-                        <X size={16} strokeWidth={2.5} aria-hidden="true" />
-                      </button>
+                          onClick={() => {
+                            if (activeSessionId) clearAgentGroupSelectionIntent(activeSessionId);
+                          }}
+                        >
+                          <WorkIcon name="close" />
+                        </button>
                     )}
                   </div>
                 )}
@@ -4154,7 +4216,6 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                       type="button"
                       className="chat-agent-tag__close"
                       data-testid="chat-panel-goal-tag-close"
-                      title={t('goal.closeTag')}
                       aria-label={t('goal.closeTag')}
                       onClick={() => {
                         if (!activeSessionId) return;
@@ -4164,7 +4225,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                         useGoalStore.getState().setArmed(activeSessionId, false);
                       }}
                     >
-                      <X size={16} strokeWidth={2.5} aria-hidden="true" />
+                      <WorkIcon name="close" />
                     </button>
                   </div>
                 )}
@@ -4187,13 +4248,12 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                           className="chat-agent-tag__close"
                           data-testid="chat-panel-plan-tag-close"
                           disabled={closeBlocked}
-                          title={closeBlocked ? t('plan.closeTagDisabled') : t('plan.closeTag')}
                           aria-label={closeBlocked ? t('plan.closeTagDisabled') : t('plan.closeTag')}
                           onClick={() => {
                             applyPlanToggle(activeSessionId, false);
                           }}
                         >
-                          <X size={16} strokeWidth={2.5} aria-hidden="true" />
+                          <WorkIcon name="close" />
                         </button>
                       );
                     })()}
@@ -4278,7 +4338,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                   }
                 />
 
-                <button
+                {taskAsrEnabled && <button
                   type="button"
                   onClick={toggleRecording}
                   disabled={composerDisabled || isTranscribing || !taskAsrSupported}
@@ -4310,7 +4370,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                   ) : (
                     <Mic className="chat-input-btn-icon" strokeWidth={1.8} aria-hidden="true" />
                   )}
-                </button>
+                </button>}
                 {micTooltipNode}
 
                 <ApplicationPluginTaskInputActions

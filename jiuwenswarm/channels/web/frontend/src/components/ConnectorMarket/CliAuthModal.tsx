@@ -96,7 +96,11 @@ export function CliAuthModal({ name, initial, onCancel, onConnected }: CliAuthMo
 
   async function handleCancel() {
     requestSeqRef.current += 1;
-    if (step.oauthSession) await useConnectorStore.getState().cancelOAuth(name, step.oauthSession);
+    if (step.oauthSession) {
+      await useConnectorStore.getState().cancelOAuth(name, step.oauthSession);
+    } else {
+      void useConnectorStore.getState().cancelConnectAction(name);
+    }
     finishedRef.current = true;
     onCancel();
   }
@@ -178,6 +182,16 @@ export function CliAuthModal({ name, initial, onCancel, onConnected }: CliAuthMo
             </button>
           </div>
         )}
+
+        <button
+          type="button"
+          onClick={handleCancel}
+          className="mt-4 flex h-9 w-full items-center justify-center gap-1.5 rounded-lg border border-border text-[13px] text-text hover:border-border-hover"
+          data-testid="connector-market-cli-auth-modal-cancel"
+        >
+          <X size={14} />
+          {t('connectorMarket.cliAuth.cancelConnect')}
+        </button>
       </div>
     </div>,
     document.body,

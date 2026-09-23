@@ -255,3 +255,20 @@ async def test_process_control_exceptions_propagate_after_cleanup(
     with pytest.raises(signal):
         await client.connect()
     assert cleaned == [True]
+
+
+def test_generic_cancel_connect_stops_remote_oauth_and_preserves_finished_grant(setup):
+    manager, _, _ = setup
+    session = manager.begin(NAME)["oauth_session"]
+    try:
+        assert registry.cancel_connect(NAME)["type"] == "cancelled"
+        with pytest.raises(oauth.OAuthError):
+            manager.wait(NAME, session)
+        assert manager.pending[NAME].server is None
+        authorize(manager)
+        registry.connect_mcp(NAME)
+        grant = manager.grant(NAME)
+        registry.cancel_connect(NAME)
+        assert manager.grant(NAME) == grant
+    finally:
+        registry.clear_connect_cancel(NAME)
