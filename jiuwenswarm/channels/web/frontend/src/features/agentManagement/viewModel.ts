@@ -1,3 +1,4 @@
+import { matchesAssetName } from '../assetNameSearch';
 import type { AgentCatalogItem, AgentDetail, AgentGroupCatalogItem, AgentGroupDetail, DefinitionFileEntry } from './types';
 
 export type CatalogScope = 'catalog' | 'mine';
@@ -12,8 +13,6 @@ export type GroupCatalogScope = 'catalog' | 'mine';
 export type GroupCatalogViewModel = {
   items: AgentGroupCatalogItem[];
   totalItems: number;
-  page: number;
-  totalPages: number;
 };
 
 const CATEGORY_ALIASES: Record<string, ReadonlySet<string>> = {
@@ -143,6 +142,7 @@ export function buildCatalogViewModel(
     if (!query) {
       return true;
     }
+    if (options.scope === 'mine') return matchesAssetName(query, item.searchNames ?? [item.displayName]);
     return `${item.displayName} ${item.description} ${item.category}`.toLocaleLowerCase().includes(query);
   });
   return {
@@ -158,8 +158,6 @@ export function buildGroupCatalogViewModel(
     category: string;
     query: string;
     installation?: 'all' | 'installed' | 'uninstalled';
-    page: number;
-    pageSize: number;
   },
 ): GroupCatalogViewModel {
   const query = options.query.trim().toLocaleLowerCase();
@@ -170,18 +168,14 @@ export function buildGroupCatalogViewModel(
       && item.installed !== (options.installation === 'installed')) return false;
     if (options.scope === 'catalog' && !matchesGroupCategory(options.category, item.category)) return false;
     if (!query) return true;
+    if (options.scope === 'mine') return matchesAssetName(query, item.searchNames ?? [item.displayName]);
     const tags = item.tags.map(tag => tag.label).join(' ');
-    return `${item.id} ${item.name} ${item.displayName} ${item.description} ${item.category} ${tags}`
+    return `${item.name} ${item.displayName} ${item.description} ${item.category} ${tags}`
       .toLocaleLowerCase()
       .includes(query);
   });
-  const totalPages = Math.max(1, Math.ceil(filtered.length / options.pageSize));
-  const page = Math.min(Math.max(options.page, 1), totalPages);
-  const start = (page - 1) * options.pageSize;
   return {
-    items: filtered.slice(start, start + options.pageSize),
+    items: filtered,
     totalItems: filtered.length,
-    page,
-    totalPages,
   };
 }

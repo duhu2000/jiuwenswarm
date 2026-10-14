@@ -48,6 +48,7 @@ from openjiuwen.agent_teams.schema.deep_agent_spec import (
     WorkspaceSpec,
     register_rail_provider,
 )
+from openjiuwen.agent_teams.schema.team import ExternalCliMemberSpec
 from openjiuwen.core.foundation.llm import ModelClientConfig
 from openjiuwen.core.foundation.tool import McpServerConfig
 from openjiuwen.core.single_agent.rail.base import (
@@ -67,6 +68,11 @@ from jiuwenswarm.agents.harness.code.rails.heartbeat.tools import (
 from jiuwenswarm.agents.harness.code.rails.heartbeat_rail import HeartbeatRail
 from jiuwenswarm.agents.harness.common.browser_defaults import (
     DEFAULT_BROWSER_AGENT_MAX_ITERATIONS,
+)
+from jiuwenswarm.agents.harness.common.a4p_execution_context import (
+    AUTHORIZATION_EXECUTION_CONTEXTS,
+    AuthorizationExecutionContext,
+    AuthorizerRoute,
 )
 from jiuwenswarm.agents.swarm import (
     SwarmBuildContext,
@@ -626,14 +632,56 @@ def test_build_member_capability_specs_rail_names(
 
 @pytest.mark.parametrize("role", ["leader", "teammate"])
 def test_build_member_capability_specs_tool_names(role: str) -> None:
-    """Both roles declare the common tool set (base / cron / send_file)."""
+    """Only the leader declares A4P on top of the common tool set."""
     config = {"agents": {"leader": {"skills": []}, "teammate": {"skills": []}}}
 
     _, tool_specs = build_member_capability_specs(config, "team", role)
     tool_names = {spec.type for spec in tool_specs}
 
-    assert tool_names == _COMMON_TOOL_NAMES
+    expected = set(_COMMON_TOOL_NAMES)
+    if role == "leader":
+        expected.add(registry.A4P_INTENT_AUTHORIZATION)
+    assert tool_names == expected
     assert all(isinstance(spec, BuiltinToolSpec) for spec in tool_specs)
+
+
+def test_a4p_intent_authorization_provider_is_interactive_web_leader_only() -> None:
+    enabled = SwarmBuildContext(
+        role="leader",
+        session_id="session-1",
+        config={"a4p": {"enabled": True}},
+    )
+    teammate = SwarmBuildContext(
+        role="teammate",
+        session_id="session-1",
+        config={"a4p": {"enabled": True}},
+    )
+
+    AUTHORIZATION_EXECUTION_CONTEXTS.clear()
+    assert tools.build_a4p_intent_authorization({}, enabled) == []
+    AUTHORIZATION_EXECUTION_CONTEXTS.activate(
+        AuthorizationExecutionContext(
+            request_id="request-1",
+            session_id="session-1",
+            channel_id="web",
+            agent_id="main_agent",
+            metadata={},
+            authorizer_route=AuthorizerRoute(
+                session_id="session-1",
+                app_id="default",
+                agent_ref_mode="team",
+                agent_ref_id="default",
+            ),
+        )
+    )
+    try:
+        built = tools.build_a4p_intent_authorization({}, enabled)
+        assert [tool.card.name for tool in built] == [
+            "request_a4p_intent_authorization"
+        ]
+        assert tools.build_a4p_intent_authorization({}, teammate) == []
+    finally:
+        AUTHORIZATION_EXECUTION_CONTEXTS.clear()
 
 
 def test_role_skills_seed_only_the_team_skill_rail() -> None:
@@ -991,6 +1039,7 @@ def test_enrich_team_spec_for_swarm_has_no_deep_agent_param() -> None:
         "channel_id",
         "request_metadata",
         "agent_group_name",
+        "agent_group_package",
     }
 
 
@@ -1413,16 +1462,69 @@ def test_enriched_spec_serialization_round_trip() -> None:
     assert any(not name.startswith("swarm.") for name in rail_types)
 
 
-def test_enrich_applies_agent_group_as_hybrid_member_snapshots(monkeypatch) -> None:
+def _write_agent_group_assembly_fixture(root: Path) -> Path:
+    package_dir = root / "sample-expert-group"
+    manifests = {
+        "leader": ("专家团负责人", "负责人描述", "."),
+        "member1": ("方案分析专家", "方案分析描述", "./persona"),
+        "member2": ("风险与质量复核专家", "风险复核描述", "./persona"),
+    }
+    (package_dir / "manifest.json").parent.mkdir(parents=True)
+    (package_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "name": "sample-expert-group",
+                "package_type": "agent_group",
+                "instruction": "Leader 负责理解用户目标",
+                "agents": list(manifests),
+                "skills": ["skill_name_1"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    headings = {
+        "leader": "专家团负责人",
+        "member1": "方案分析专家",
+        "member2": "风险与质量复核专家",
+    }
+    for member_id, (name, description, persona_dir) in manifests.items():
+        member_dir = package_dir / "agents" / member_id
+        (member_dir / "manifest.json").parent.mkdir(parents=True)
+        (member_dir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "package_type": "agent_template",
+                    "name": name,
+                    "description": description,
+                    "persona": {"dir": persona_dir},
+                }
+            ),
+            encoding="utf-8",
+        )
+        persona = member_dir / "persona" / f"{member_id}.md"
+        persona.parent.mkdir(parents=True)
+        persona.write_text(f"# {headings[member_id]}\n", encoding="utf-8")
+    (package_dir / "agents" / "leader" / "AGENT.md").write_text(
+        "# Expert Group Leader\n",
+        encoding="utf-8",
+    )
+    skill = package_dir / "skills" / "skill_name_1" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("# Shared skill\n", encoding="utf-8")
+    return package_dir
+
+
+def test_enrich_applies_agent_group_as_hybrid_member_snapshots(
+    monkeypatch, tmp_path: Path
+) -> None:
     """AgentGroup prompts stay Team-owned while capabilities use snapshots."""
     from jiuwenswarm.server.runtime import extension_package_manager as package_manager
 
-    resources = package_manager.get_equipment_resources_agent_groups_dir()
-    assert resources is not None
+    package_dir = _write_agent_group_assembly_fixture(tmp_path)
     monkeypatch.setattr(
         package_manager,
         "resolve_agent_group_dir",
-        lambda _name: resources / "sample-expert-group",
+        lambda _name: package_dir,
     )
     monkeypatch.setattr(
         package_manager,
@@ -1488,6 +1590,42 @@ def test_enrich_applies_agent_group_as_hybrid_member_snapshots(monkeypatch) -> N
         }
         assert restored_members["member1"].prompt == predefined["member1"].prompt
         assert restored.leader.prompt == spec.leader.prompt
+
+
+def test_enrich_agent_group_builds_predefined_external_member(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from jiuwenswarm.server.runtime import extension_package_manager as package_manager
+
+    group = _write_agent_group_assembly_fixture(tmp_path)
+    manifest_path = group / "agents" / "member1" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["runtime"] = {
+        "provider_name": "codex",
+        "provider_version": "0.1.0",
+        "config": {},
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(package_manager, "resolve_agent_group_dir", lambda _name: group)
+
+    spec = _make_team_spec()
+    enrich_team_spec_for_swarm(
+        spec,
+        session_id="s",
+        mode="team",
+        channel_id="web",
+        agent_group_name="sample-expert-group",
+    )
+
+    members = {member.member_name: member for member in spec.predefined_members}
+    member = members["member1"]
+    assert isinstance(member, ExternalCliMemberSpec)
+    assert member.external_cli.cli_agent == "codex"
+    assert [Path(skill["dir"]).name for skill in member.external_cli.skills] == [
+        "skill_name_1"
+    ]
+    assert spec.agents["member1"].agent_template_spec is None
 
 
 def test_send_file_returns_empty_without_request_id() -> None:
@@ -2277,6 +2415,7 @@ def test_code_capability_specs_rail_and_tool_names(mode: str) -> None:
         registry.VISUAL_GEN,
         registry.XIAOYI_PHONE,
         registry.SYMPHONY_TOOLKIT,
+        registry.A4P_INTENT_AUTHORIZATION,
         registry.CODE_EXTRA_TOOLS,
         registry.CRON_TOOLS,
         registry.SEND_FILE,

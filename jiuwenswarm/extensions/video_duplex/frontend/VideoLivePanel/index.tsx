@@ -30,6 +30,7 @@ import { webClient, webRequest } from '../../../../channels/web/frontend/src/ser
 import { createRealtimeDuplexSession, RealtimeDuplexSession } from './qwenOmniSession';
 import { isVideoSourceReady, RealtimeVideoFrameScheduler, waitForFirstVideoFrame } from './videoSource';
 import { JoyAIProvider } from './joyaiProvider';
+import { describeDuplexError } from '../duplexErrorMessage';
 import {
   mergeSearchProgressJob,
   searchAwareToolStatus,
@@ -246,7 +247,7 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
     setSearchStatus('');
   };
 
-  const getJoyAIProvider = (): JoyAIProvider => {
+  const getJoyAIProvider = (replyLanguage?: VideoSessionConfig['reply_language']): JoyAIProvider => {
     const callbacks = {
       getLatestFrameDataUrl: () => framesRef.current.at(-1)?.data_url || '',
       getFrameCount: () => framesRef.current.length,
@@ -279,9 +280,10 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
       report: reportRealtimeEvent,
     };
     if (!joyaiProviderRef.current) {
-      joyaiProviderRef.current = new JoyAIProvider(callbacks);
+      joyaiProviderRef.current = new JoyAIProvider(callbacks, replyLanguage);
     } else {
       joyaiProviderRef.current.updateCallbacks(callbacks);
+      if (replyLanguage) joyaiProviderRef.current.setPreferredLanguage(replyLanguage);
     }
     return joyaiProviderRef.current;
   };
@@ -377,7 +379,7 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
     const callId = payload.tool_call_id?.trim() || existing?.toolCallId;
     const turnId = payload.turn_id?.trim() || existing?.turnId;
     const error = payload.error?.trim() || 'Jiuwen Core Agent failed';
-    const failureText = `Jiuwen Core Agent 未能完成任务：${error}`;
+    const failureText = describeDuplexError(error, 'task');
     if (!headless) appendChat('assistant', failureText, 'tool_result');
     if (callId) {
       duplexRef.current?.enqueueToolResult({
@@ -825,7 +827,7 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
         });
         setModel(config.model);
         if (config.provider === 'joyai') {
-          await getJoyAIProvider().start();
+          await getJoyAIProvider(config.reply_language).start();
           return;
         }
         const videoFrames = new RealtimeVideoFrameScheduler(1_000);
@@ -834,6 +836,7 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
             url: config.url || '',
             voice: config.voice,
             tools: config.tools,
+            replyLanguage: config.reply_language,
           },
           {
             getVideoFrame: () => {
@@ -971,7 +974,7 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
                   reportRealtimeEvent('qwen_tool_call_receipt', {
                     name: call.name, call_id: call.callId, decision: 'rejected', message,
                   });
-                  setError(message);
+                  setError(describeDuplexError(message, 'task'));
                   session.enqueueOperationResult(call.callId, { state: 'rejected', error: message });
                 });
             },
@@ -1027,11 +1030,20 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
   }, [headless, screens.length]);
 
   useEffect(() => {
+    if (!isRecording && !isRealtimeStarting) return;
+    return webClient.onStateChange((state) => {
+      if (state !== 'closed' && state !== 'reconnecting') return;
+      setError((previous) => previous || 'Jiuwen 服务连接已断开，未提供具体原因。请检查网络或本地服务后重新启动全双工。');
+      stopRealtime();
+    });
+  }, [isRecording, isRealtimeStarting]);
+
+  useEffect(() => {
     onRuntimeState?.(isRealtimeStarting ? 'starting' : isRecording ? 'active' : 'idle');
   }, [isRealtimeStarting, isRecording, onRuntimeState]);
 
   useEffect(() => {
-    if (error) onError?.(error);
+    if (error) onError?.(describeDuplexError(error));
   }, [error, onError]);
 
   useImperativeHandle(ref, () => ({
@@ -1294,7 +1306,7 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
             )}
           </div>
 
-          {error && <div className="video-live__error">{error}</div>}
+          {error && <div className="video-live__error" data-testid="video-live-error-message" role="alert">{describeDuplexError(error)}</div>}
           {realtimeStatus && <div className="video-live__realtime-status">{realtimeStatus}</div>}
           {visibleSearchProgress && (
             <div className={`video-live__search-progress is-${visibleSearchProgress.status}`}>
@@ -1383,6 +1395,7 @@ export const VideoLivePanel = forwardRef<VideoLivePanelHandle, VideoLivePanelPro
             <button
               type="button"
               className={`video-live__mic${isRecording ? ' is-recording' : ''}`}
+              data-testid="video-live-session-toggle"
               onClick={isRecording ? stopRealtime : () => void startRealtime()}
               disabled={isRealtimeStarting && !isRecording}
               aria-label={

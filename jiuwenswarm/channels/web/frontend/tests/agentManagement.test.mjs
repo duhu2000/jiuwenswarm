@@ -24,6 +24,8 @@ test('keeps Hub Expert Teams distinct from local groups', () => {
 import {
   buildDefinitionSelectionPayload,
   buildDefinitionSelectionPayloadForMode,
+  isAgentGroupSelected,
+  resolveSelectedSkillsForRequest,
 } from '../node_modules/.cache/agent-management/port.js';
 import { isAgentUploadFilename } from '../node_modules/.cache/agent-management/upload.js';
 import {
@@ -47,6 +49,37 @@ import {
   findFirstPreviewableFile,
   mergeAgentDetailWithCatalog,
 } from '../node_modules/.cache/agent-management/viewModel.js';
+import {
+  advancePendingInstallQueue,
+  createPendingInstallQueue,
+  enqueuePendingInstall,
+} from '../node_modules/.cache/agent-management/pendingInstallQueue.js';
+
+test('pending Expert installs keep target identity while connector flows run serially', () => {
+  const first = {
+    id: 'expert-a', mode: 'catalog', pendingConnectors: ['connector-a'],
+  };
+  const second = {
+    id: 'expert-b', mode: 'group-picker', pendingConnectors: ['connector-b'],
+  };
+  const queued = enqueuePendingInstall(
+    enqueuePendingInstall(createPendingInstallQueue(), first),
+    second,
+  );
+
+  assert.deepEqual(queued.active, first);
+  assert.deepEqual(queued.waiting, [second]);
+
+  const afterFirst = advancePendingInstallQueue(queued);
+  assert.deepEqual(afterFirst.finished, first);
+  assert.deepEqual(afterFirst.queue.active, second);
+  assert.deepEqual(afterFirst.queue.waiting, []);
+
+  const afterSecond = advancePendingInstallQueue(afterFirst.queue);
+  assert.deepEqual(afterSecond.finished, second);
+  assert.equal(afterSecond.queue.active, null);
+  assert.deepEqual(afterSecond.queue.waiting, []);
+});
 
 test('selection pickers share installed-first and label sorting', () => {
   const items = [
@@ -158,22 +191,21 @@ test('Expert Team plaza includes Hub groups alongside built-in groups', () => {
     { id: 'remote', source: 'hub', category: '', tags: [], name: 'remote', displayName: 'Remote', description: '' },
     { id: 'mine', source: 'local', category: '', tags: [], name: 'mine', displayName: 'Mine', description: '' },
   ];
-  const view = buildGroupCatalogViewModel(items, { scope: 'catalog', category: '', query: '', page: 1, pageSize: 10 });
+  const view = buildGroupCatalogViewModel(items, { scope: 'catalog', category: '', query: '' });
   assert.deepEqual(view.items.map(item => item.id), ['built-in', 'remote']);
 });
 
-test('Expert Team plaza filters installed state before pagination', () => {
+test('Expert Team plaza filters installed state', () => {
   const items = [
     { id: 'installed', source: 'hub', installed: true, category: '', tags: [], name: 'installed', displayName: 'Installed', description: '' },
     { id: 'pending', source: 'hub', installed: false, category: '', tags: [], name: 'pending', displayName: 'Pending', description: '' },
   ];
-  const options = { scope: 'catalog', category: '', query: '', page: 2, pageSize: 1 };
+  const options = { scope: 'catalog', category: '', query: '' };
   const installed = buildGroupCatalogViewModel(items, { ...options, installation: 'installed' });
   const uninstalled = buildGroupCatalogViewModel(items, { ...options, installation: 'uninstalled' });
   assert.deepEqual(installed.items.map(item => item.id), ['installed']);
   assert.deepEqual(uninstalled.items.map(item => item.id), ['pending']);
   assert.equal(installed.totalItems, 1);
-  assert.equal(installed.page, 1);
 });
 
 test('My Expert Teams filters install state before pagination', () => {
@@ -182,14 +214,13 @@ test('My Expert Teams filters install state before pagination', () => {
     { id: 'local-pending', source: 'local', installed: false, category: '', tags: [], name: 'local-pending', displayName: 'Local pending', description: '' },
     { id: 'hub-installed', source: 'hub', installed: true, category: '', tags: [], name: 'hub-installed', displayName: 'Hub installed', description: '' },
   ];
-  const options = { scope: 'mine', category: '', query: '', page: 2, pageSize: 1 };
+  const options = { scope: 'mine', category: '', query: '' };
   const installed = buildGroupCatalogViewModel(items, { ...options, installation: 'installed' });
   const uninstalled = buildGroupCatalogViewModel(items, { ...options, installation: 'uninstalled' });
-  assert.deepEqual(installed.items.map(item => item.id), ['hub-installed']);
+  assert.deepEqual(installed.items.map(item => item.id), ['local-installed', 'hub-installed']);
   assert.equal(installed.totalItems, 2);
   assert.deepEqual(uninstalled.items.map(item => item.id), ['local-pending']);
   assert.equal(uninstalled.totalItems, 1);
-  assert.equal(uninstalled.page, 1);
 });
 
 test('normalizes interface source variants and bilingual display fields', () => {
@@ -214,6 +245,7 @@ test('normalizes interface source variants and bilingual display fields', () => 
     id: 'python-code-reviewer',
     runtimePackageName: 'python-code-reviewer',
     displayName: 'Python Code Reviewer',
+    searchNames: ['Python 代码检视专家', 'Python Code Reviewer'],
     description: 'Reviews Python code',
     category: 'Engineering',
     source: 'builtin',
@@ -371,6 +403,23 @@ test('selection payload preserves keep, clear and select semantics', () => {
   });
 });
 
+test('Agent Group selection owns the Team skill slot across selection states', () => {
+  assert.equal(isAgentGroupSelected('agent', { kind: 'select', id: 'group-1' }), false);
+  assert.equal(isAgentGroupSelected('team', { kind: 'keep' }), false);
+  assert.equal(isAgentGroupSelected('team', { kind: 'select', id: 'group-1' }), true);
+  assert.equal(isAgentGroupSelected('team', { kind: 'keep' }, 'group-1'), true);
+  assert.equal(isAgentGroupSelected('team', { kind: 'keep' }, null, 'group-1'), true);
+  assert.equal(isAgentGroupSelected('team', { kind: 'select', id: '  ' }), false);
+  assert.deepEqual(
+    resolveSelectedSkillsForRequest('team', ['team-skill'], { kind: 'keep' }, 'group-1'),
+    [],
+  );
+  assert.deepEqual(
+    resolveSelectedSkillsForRequest('team', ['team-skill'], { kind: 'keep' }),
+    ['team-skill'],
+  );
+});
+
 test('Agent upload accepts only zip and tar archives', () => {
   assert.equal(isAgentUploadFilename('agent.ZIP'), true);
   assert.equal(isAgentUploadFilename('agent.tar'), true);
@@ -435,7 +484,7 @@ test('catalog view model filters mine/search and returns the full filtered list'
   const view = buildCatalogViewModel(catalog, {
     scope: 'mine',
     category: '',
-    query: '市场',
+    query: '甲',
   });
 
   assert.equal(view.totalItems, 1);
@@ -586,4 +635,16 @@ test('agent detail does not display summary data when the full detail request fa
   assert.equal(failed.detailStatus, 'error');
   assert.equal(failed.detail, null);
   assert.equal(failed.detailError, 'Hub timeout');
+});
+
+test('mine experts match both display languages and exclude description, tags and ids', () => {
+  const item = normalizeAgentTemplateListItem({
+    id: 'hidden-package-6', source: 'local', installed: true,
+    displayName: { zh: '工程顾问', en: 'Quality Advisor' },
+    displayDescription: { zh: '生成报告' }, category: 'hidden-category',
+    tags: [{ zh: 'hidden-tag' }],
+  }, 'zh');
+  const search = query => buildCatalogViewModel([item], { scope: 'mine', category: '', query }).totalItems;
+  for (const q of ['工程', ' QUALITY ', 'ＱＵＡＬＩＴＹ']) assert.equal(search(q), 1, q);
+  for (const q of ['生成', 'hidden', '6']) assert.equal(search(q), 0, q);
 });

@@ -5,6 +5,11 @@
   background: var(--color-surface-card);
 }
 
+/* 表单页铺满到底部，抵消全局 .page-content 的 16px 底边距（Chrome 107 已支持 :has） */
+.page-content:has(.form-page-layout) {
+  margin-bottom: 0;
+}
+
 .form-page-layout__header {
   display: flex;
   flex-direction: column;
@@ -83,8 +88,13 @@
 }
 
 .form-page-layout__footer-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  white-space: nowrap;
   padding: 0 16px;
-  width: 84px;
+  min-width: 84px;
   min-height: 32px;
   border: 1px solid var(--color-control-emphasis);
   border-radius: 16px;
@@ -93,6 +103,9 @@
   font-size: 14px;
   line-height: 20px;
   cursor: pointer;
+}
+.form-page-layout__footer-btn > svg {
+  flex: 0 0 auto;
 }
 
 .form-page-layout__footer-btn:hover {

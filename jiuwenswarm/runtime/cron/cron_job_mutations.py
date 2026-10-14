@@ -75,10 +75,21 @@ def infer_work_mode_from_targets(job_item: dict[str, Any]) -> str:
     return DEFAULT_WEB_WORK_MODE
 
 
+_cron_project_lister: Any = None
+
+
+def set_cron_project_lister(list_projects: Any) -> None:
+    """Gateway 注入自己的项目表读取函数，避免 runtime 引用 gateway。"""
+    global _cron_project_lister
+    _cron_project_lister = list_projects
+
+
 def build_cron_project_lookup() -> dict[str, str]:
     """构建 project_id → work_mode 映射,供 cron job 惰性迁移推断 work_mode。"""
     try:
-        from jiuwenswarm.server.runtime.session.project_store import list_projects
+        list_projects = _cron_project_lister
+        if list_projects is None:
+            from jiuwenswarm.server.runtime.session.project_store import list_projects
 
         return {
             p.project_id: p.work_mode
@@ -153,10 +164,12 @@ def build_new_cron_job(
     timeout_seconds: int | None = None,
     project_id: str = "",
     model_name: str | None = None,
+    model_selection: dict[str, str] | None = None,
     mcp: list[str] | None = None,
     app_id: str = "",
     work_mode: str = DEFAULT_WEB_WORK_MODE,
     user_id: str = "",
+    credential_ref: str = "",
 ) -> CronJob:
     """Construct and validate a ``CronJob`` without persisting it."""
     now = time.time()
@@ -209,10 +222,12 @@ def build_new_cron_job(
         timeout_seconds=timeout,
         project_id=pid,
         model_name=model_name_val,
+        model_selection=model_selection,
         mcp=normalize_cron_job_mcp(mcp),
         app_id=str(app_id or "").strip(),
         work_mode=normalize_work_mode(work_mode, default=DEFAULT_WEB_WORK_MODE),
         user_id=str(user_id or "").strip(),
+        credential_ref=str(credential_ref or "").strip(),
     )
     CronJob.from_dict(job.to_dict())
     return job
@@ -243,6 +258,9 @@ def ensure_proactive_deletable(existing: CronJob | None, *, force: bool) -> None
 
 
 def apply_cron_job_patch(existing: CronJob, patch: dict[str, Any]) -> CronJob:
+    if "_expected_legacy_model_name" in patch:
+        if existing.model_selection is not None or existing.model_name != patch["_expected_legacy_model_name"]:
+            return existing
     patch = filter_proactive_update_patch(existing, dict(patch or {}))
     updated = existing
     if "name" in patch:
@@ -329,6 +347,27 @@ def apply_cron_job_patch(existing: CronJob, patch: dict[str, Any]) -> CronJob:
             else None
         )
         updated = replace(updated, model_name=new_model_name)
+        if "model_selection" not in patch and new_model_name != existing.model_name:
+            # 显式按名称选模型时，清除迁移留下的 ID 选择；否则调度请求
+            # 同时带两个字段，执行侧会优先使用旧 model_selection。
+            updated = replace(updated, model_selection=None)
+    if "model_selection" in patch:
+        raw_selection = patch.get("model_selection")
+        if raw_selection is None:
+            updated = replace(updated, model_selection=None)
+        else:
+            from jiuwenswarm.common.model_selection import ModelSelection
+            selection = ModelSelection.model_validate(raw_selection)
+            from jiuwenswarm.server.runtime.model_routing_registry import ModelSelectionResolver
+            ModelSelectionResolver().resolve(selection)
+            updated = replace(updated, model_selection=selection.model_dump())
+    if "credential_ref" in patch:
+        # 模型来源切换时由 controller 重算：登录模型 → 绑定创建会话的华为账号
+        # 句柄；自配模型/清除模型 → 解绑（空串）。
+        updated = replace(
+            updated,
+            credential_ref=str(patch.get("credential_ref") or "").strip(),
+        )
     if "mcp" in patch:
         # 显式传 null/[] 归 None（不注入）；非字符串元素被过滤。
         updated = replace(updated, mcp=normalize_cron_job_mcp(patch.get("mcp")))

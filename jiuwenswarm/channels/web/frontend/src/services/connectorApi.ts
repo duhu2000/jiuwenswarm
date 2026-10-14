@@ -1,3 +1,4 @@
+import { assetSearchNames } from '../features/assetNameSearch';
 import { withCatalogCache, type CatalogItems, type CatalogCacheMetadata } from '../features/catalogCache';
 import { webRequest } from './webClient';
 import type {
@@ -34,6 +35,7 @@ interface RawConnectorSummary {
   name: string;
   package_name?: string;
   display_name: string;
+  display_name_i18n?: { zh?: string; en?: string };
   description: string;
   category: string;
   integration_type: ConnectorSummary['integrationType'];
@@ -67,6 +69,7 @@ function fromRawSummary(raw: RawConnectorSummary): ConnectorSummary {
     runtimePackageName: identity.runtimePackageName,
     hubAssetId: identity.hubAssetId,
     displayName: raw.display_name,
+    searchNames: assetSearchNames(raw.display_name_i18n, raw.display_name || raw.name),
     description: raw.description,
     category: raw.category,
     integrationType: raw.integration_type,
@@ -187,8 +190,13 @@ export const connectorApi = {
   // (local，= 已连接的预置 + 全部自定义)。实测过 dev_aipc_feat_v2 分支：缺省 filter 时后端按
   // "builtin" 处理，之前不传 filter 的单次调用会让"我的MCP"完全看不到自定义 MCP，是真实 bug，
   // 不是理论风险（评估过程见 cjh/feature/MCP/_migration/mcp-interface-v2-gap-assessment.md）。
-  list: async (filter: 'builtin' | 'local'): Promise<CatalogItems<ConnectorSummary>> => {
-    const payload = await requestEquipmentList<{ items: RawConnectorSummary[]; cache?: CatalogCacheMetadata }>(webRequest, 'mcp.list', { filter });
+  list: async (filter: 'builtin' | 'local', query = ''): Promise<CatalogItems<ConnectorSummary>> => {
+    const payload = await requestEquipmentList<{ items: RawConnectorSummary[]; cache?: CatalogCacheMetadata }>(
+      webRequest,
+      'mcp.list',
+      { filter, ...(query ? { query } : {}) },
+      !query,
+    );
     return withCatalogCache(payload.items.map(fromRawSummary), payload.cache);
   },
   show: async (id: string): Promise<ConnectorDetail> => {

@@ -13,6 +13,8 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Coroutine
 
+from jiuwenswarm.common.client.agent_client import AgentServerClient
+
 from jiuwenswarm.common.e2a.models import E2AEnvelope
 from jiuwenswarm.common.schema.agent import AgentResponse, AgentResponseChunk
 from jiuwenswarm.common.schema.message import ReqMethod
@@ -35,6 +37,8 @@ from jiuwenswarm.extensions.agentos.auth.credential_authenticator import AuthCon
 from jiuwenswarm.extensions.agentos.agentos_router.config import (
     DEFAULT_AGENT_WORKSPACE_ROOT,
     SshChannelEndpoint,
+    read_mapping_path,
+    read_optional_float,
 )
 from jiuwenswarm.extensions.agentos.agentos_router.logutil import (
     agentos_extra,
@@ -86,10 +90,7 @@ from jiuwenswarm.extensions.agentos.auth.ssh_key_issuer import SshKeyIssuer
 from jiuwenswarm.gateway import ChannelManager
 from jiuwenswarm.gateway.channel_manager.base import ChannelType
 from jiuwenswarm.server.runtime.attachments.document_attachments import is_forbidden_document
-from jiuwenswarm.gateway.routing.agent_client import (
-    AgentServerClient,
-    WebSocketAgentServerClient,
-)
+from jiuwenswarm.gateway.routing.agent_client import WebSocketAgentServerClient
 from jiuwenswarm.server.runtime.attachments.upload_storage import safe_upload_filename
 
 
@@ -233,13 +234,17 @@ def _first_nonempty(*values: Any) -> str:
     return ""
 
 
+def _pick_keys(source: Mapping[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+    """Copy only the ``keys`` that exist in ``source``."""
+    return {key: source[key] for key in keys if key in source}
+
+
 def _extract_placement_ips(instance_info: Mapping[str, Any] | None) -> tuple[str, str]:
     """Read node / sandbox IP from YuanRong GET, including jiuwenbox aliases.
 
-    Register writes a placeholder ``address`` (instance_id) because the
-    registry rejects empty address. Placement must be PATCHed once the
-    actual IPs exist. YuanRong may use ``node_ip`` / ``sandbox_ip`` or
-    pass through jiuwenbox ``ip_address``.
+    Register leaves ``address`` and ``node`` empty. Placement must be
+    PATCHed once the actual IPs exist. YuanRong may use ``node_ip`` /
+    ``sandbox_ip`` or pass through jiuwenbox ``ip_address``.
     """
     if not isinstance(instance_info, Mapping):
         return "", ""
@@ -538,7 +543,7 @@ class AgentOSRouterClient(AgentServerClient):
         self._ws_connecting: dict[str, asyncio.Future[WebSocketAgentServerClient]] = {}
         self._ws_client_factory = ws_client_factory or WebSocketAgentServerClient
         self._push_handler: Callable[[dict[str, Any]], Awaitable[None]] | None = None
-
+        self._server_config: dict[str, Any] = {}
 
     def set_channel_manager(self, channel_manager: ChannelManager) -> None:
         """Attach handshake IAM for Web/TUI and subscribe channel disconnect events."""
@@ -676,12 +681,22 @@ class AgentOSRouterClient(AgentServerClient):
         token_path = path if allow_query_token else urllib.parse.urlparse(path).path
         header_map = headers_to_dict(headers)
         token = extract_token_from_path_and_headers(token_path, header_map or headers)
-        return await self._verify_request_token(
+        result = await self._verify_request_token(
             token=token,
             headers=header_map,
             remote=remote,
             channel=channel,
         )
+        if channel == "web" and result.success:
+            if self.auth_enabled:
+                if not str(result.user_id or "").strip():
+                    return AuthResult(success=False, error="authenticated user identity is missing")
+            else:
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+                query_user_id = str((query.get("user_id") or [""])[0] or "").strip()
+                if query_user_id:
+                    result.user_id = query_user_id
+        return result
 
     def set_key_issuer(
         self,
@@ -1201,6 +1216,9 @@ class AgentOSRouterClient(AgentServerClient):
         config: dict[str, Any],
         env: dict[str, str] | None = None,
     ) -> None:
+        if config:
+            import copy
+            self._server_config = copy.deepcopy(config)
         self._yuanrong.set_or_update_server_config(config=config, env=env)
 
     def set_server_push_handler(
@@ -2249,6 +2267,61 @@ class AgentOSRouterClient(AgentServerClient):
 
     # ---------- idle sandbox reclamation ----------
 
+    def apply_remote_overrides(self, overrides: Mapping[str, Any]) -> None:
+        """Apply remotely-managed fields to the running process.
+
+        Narrow interface, no reconnect. Handles the data-plane
+        ``agent_sandbox.idle_timeout``, which is otherwise frozen at
+        construction -- this is its only runtime update path.
+
+        The management plane outranks env here: the remote value wins even when
+        ``SANDBOX_IDLE_TIMEOUT_SECONDS`` is set (env is only a startup fallback).
+        A remote document that omits the field leaves the current value untouched
+        -- it must not fall back to env/yaml, so deleting the field does not roll
+        anything back.
+
+        Starts/stops the reaper in both directions (0 disables reclamation).
+        """
+        agent_sandbox_section = read_mapping_path(overrides, "agent_sandbox")
+        new_timeout = read_optional_float(
+            agent_sandbox_section,
+            "idle_timeout",
+        )
+        if new_timeout is None:
+            # Field not pushed (or deleted): keep the current value.
+            return
+
+        previous = self._sandbox_idle_timeout_seconds
+        if new_timeout == previous:
+            return
+
+        self._sandbox_idle_timeout_seconds = new_timeout
+        log_agentos(
+            logger,
+            logging.INFO,
+            "config.sandbox_idle_timeout.update",
+            previous=previous,
+            current=new_timeout,
+        )
+
+        if new_timeout <= 0:
+            self._cancel_idle_reaper()
+        elif previous <= 0:
+            # Was disabled, now enabled: start the reaper. When both are
+            # positive the running loop already reads the new value, and
+            # ``create_task`` would need a running event loop we may not have.
+            self._ensure_idle_reaper_task()
+
+    def _cancel_idle_reaper(self) -> None:
+        """Cancel the reaper from a sync context (does not join the task).
+
+        Clears the handle first so a following enable can start a fresh task.
+        """
+        task = self._idle_reaper_task
+        self._idle_reaper_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
     def _idle_reaper_enabled(self) -> bool:
         return self._sandbox_idle_timeout_seconds > 0
 
@@ -2374,14 +2447,41 @@ class AgentOSRouterClient(AgentServerClient):
                 "cmds": [["sh", "-c", f"exec jiuwenswarm-agentserver --port {port}"]],
                 "probes": self._probe_settings.tcp_probes(port, with_liveness=True),
                 "cpu": int(os.environ.get("AGENTOS_BUILTIN_AGENT_CPU", "2000")),
-                "memory": int(os.environ.get("AGENTOS_BUILTIN_AGENT_MEMORY", "4096"))
+                "memory": int(os.environ.get("AGENTOS_BUILTIN_AGENT_MEMORY", "4096")),
             }
             # 不注入 AGENT_SERVER_HOST: 留空让沙箱内 agentserver 自行检测沙箱本地
             # 非 loopback IP(ISOLATED 模式 bind veth 地址,外部可达;见
             # app_agentserver._resolve_bind_host)。单机版默认仍 127.0.0.1。
             env_vars = {
                 USER_DIRECTORY_ENV_KEY: workspace,
+                "JIUWENSWARM_RUNTIME_PROFILE": "agentos",
             }
+            from jiuwenswarm.runtime.cron.factory import load_cron_store_settings
+            import json
+
+            endpoints = load_cron_store_settings(self._server_config).endpoints
+            if endpoints:
+                env_vars["JIUWENBOX_ETCD_ENDPOINTS"] = ",".join(endpoints)
+            graph_config = self._server_config.get("code_graph")
+            if isinstance(graph_config, dict):
+                env_vars["JIUWENSWARM_AGENTOS_CODE_GRAPH_CONFIG"] = json.dumps(graph_config)
+            sandbox_config = self._server_config.get("sandbox")
+            if isinstance(sandbox_config, dict):
+                # Deployment defaults only: do not broadcast local host paths,
+                # file lists, credentials or YuanRong resource knobs to users.
+                deployment = _pick_keys(sandbox_config, (
+                    "type", "enabled", "startup_mode", "url", "template_name",
+                    "user", "group",
+                ))
+                conch = sandbox_config.get("conch")
+                if isinstance(conch, dict):
+                    deployment["conch"] = _pick_keys(conch, (
+                        "vcpu_num", "vcpu_max", "ram_mb", "network",
+                    ))
+                env_vars["JIUWENSWARM_AGENTOS_SANDBOX_CONFIG"] = json.dumps(deployment)
+                sdk_config = str(sandbox_config.get("conch_sdk_config") or "").strip()
+                if sdk_config:
+                    env_vars["CONCH_SDK_CONFIG"] = sdk_config
             # create 后 Gateway 通过 frontend WS 代理直连该端口（不走 invoke）。
             extra_metadata: dict[str, Any] = {"agent_port": port}
         else:
@@ -2640,6 +2740,61 @@ class AgentOSRouterClient(AgentServerClient):
                 str(info.sandbox_id or ""),
             )
 
+    async def _cleanup_agent_after_create_not_running(
+        self,
+        agent_info: AgentInfo,
+        *,
+        exc: BaseException,
+    ) -> None:
+        """create 已成功但一直未 running：删沙箱并注销注册中心占位行。
+
+        登记发生在 wait 之前。探针超时 / failed 时若只打日志，YuanRong 实例和
+        ``POST /api/instances`` 写入的条目都会留下。与请求路径
+        :meth:`_cleanup_agent_on_instance_unavailable` 共用 :meth:`delete_agent`；
+        runtime 若已被并发 cleanup 摘掉，仍补一次 unregister（幂等）。
+        """
+        session_id = str(agent_info.metadata.get("session_id") or "")
+        sandbox_id = str(agent_info.sandbox_id or "")
+        log_agentos(
+            logger,
+            logging.WARNING,
+            "sandbox.cleanup.not_running",
+            user_id=agent_info.user_id,
+            session_id=session_id,
+            sandbox_id=sandbox_id,
+            agent_type=agent_info.agent_type,
+            instance=sandbox_id,
+            reason=type(exc).__name__,
+        )
+        key_values: dict[str, Any] | None = None
+        if "session_id" in self._agent_manager.key_fields and session_id:
+            key_values = {"session_id": session_id}
+        try:
+            deleted = await self.delete_agent(
+                agent_info.user_id,
+                agent_info.agent_type,
+                key_values=key_values,
+            )
+        except Exception:  # noqa: BLE001 - background register must not raise
+            logger.exception(
+                "[AgentOSRouter] not-running cleanup failed: "
+                "user_id=%s agent_type=%s sandbox_id=%s",
+                agent_info.user_id,
+                agent_info.agent_type,
+                sandbox_id,
+            )
+            deleted = False
+        if deleted:
+            return
+        try:
+            await self._unregister_agent(agent_info)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "[AgentOSRouter] unregister after not-running cleanup failed: "
+                "agent_id=%s",
+                agent_info.agent_id,
+            )
+
     async def _cleanup_agent_on_instance_unavailable(
         self,
         runtime: AgentRuntime,
@@ -2846,16 +3001,24 @@ class AgentOSRouterClient(AgentServerClient):
             ):
                 return
 
-            # create 返回时沙箱通常还在探针中：placeholder address=instance_id。
+            # create 返回时沙箱通常还在探针中：address 与 node 都留空。
             # 等到 status=running 后再读 node_ip / sandbox_ip（含 jiuwenbox
             # ip_address），PATCH 注册中心 placement，供调度/路由使用。
+            # 一直到不了 running（超时 / failed）时删沙箱并注销刚才写入的登记，
+            # 避免 CREATING 实例和占位 registry 行一直留着（cron 无用户断连回收）。
             sandbox_id = str(agent_info.sandbox_id or "").strip()
-            instance_info = await self._wait_yuanrong_running(
-                sandbox_id,
-                user_id=str(agent_info.user_id or ""),
-                session_id=str(agent_info.metadata.get("session_id") or ""),
-                agent_type=str(agent_info.agent_type or ""),
-            )
+            try:
+                instance_info = await self._wait_yuanrong_running(
+                    sandbox_id,
+                    user_id=str(agent_info.user_id or ""),
+                    session_id=str(agent_info.metadata.get("session_id") or ""),
+                    agent_type=str(agent_info.agent_type or ""),
+                )
+            except YuanrongAgentApiError as exc:
+                await self._cleanup_agent_after_create_not_running(
+                    agent_info, exc=exc
+                )
+                return
             node_ip, sandbox_ip = _extract_placement_ips(instance_info)
             if not (node_ip or sandbox_ip):
                 log_agentos(

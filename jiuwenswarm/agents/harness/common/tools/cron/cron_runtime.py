@@ -145,9 +145,11 @@ class _CronToolsCronBackend(CronToolBackend):
             inherited = str(meta.get("model") or "").strip()
             if not inherited:
                 return payload
-            from jiuwenswarm.runtime.cron.models import validate_cron_model
+            from jiuwenswarm.agents.harness.common.tools.cron.cron_tools import (
+                resolve_agent_cron_model,
+            )
 
-            canonical = validate_cron_model(inherited)
+            canonical = resolve_agent_cron_model(inherited)
             if canonical:
                 out = dict(payload)
                 out["model_name"] = canonical
@@ -165,6 +167,43 @@ class _CronToolsCronBackend(CronToolBackend):
                 exc,
             )
         return payload
+
+    @staticmethod
+    def _inherit_session_mode(
+        payload: dict[str, Any],
+        context: CronToolContext | None,
+    ) -> dict[str, Any]:
+        """Use the creating chat session's mode, not a team member's agent mode."""
+        session_id = getattr(context, "session_id", None)
+        if not (isinstance(session_id, str) and session_id.strip()):
+            return payload
+        try:
+            from jiuwenswarm.server.runtime.session.session_metadata import (
+                get_session_metadata,
+            )
+            from jiuwenswarm.runtime.cron.models import normalize_cron_job_mode
+
+            meta = get_session_metadata(session_id, cache_bust=True)
+            mode = str(meta.get("mode") or "").strip() if isinstance(meta, dict) else ""
+            if not mode:
+                return payload
+            inherited = normalize_cron_job_mode(mode)
+            out = dict(payload)
+            out["mode"] = inherited
+            logger.info(
+                "[CronRuntimeBridge] cron job reuses chat-session mode: "
+                "session=%s mode=%s",
+                session_id,
+                inherited,
+            )
+            return out
+        except Exception as exc:  # noqa: BLE001 - 继承失败不阻断创建
+            logger.debug(
+                "[CronRuntimeBridge] reuse session mode failed session=%s: %s",
+                session_id,
+                exc,
+            )
+            return payload
 
     @staticmethod
     def _inherit_session_mcp(
@@ -228,6 +267,22 @@ class _CronToolsCronBackend(CronToolBackend):
             return None
         return self._to_backend_job(job)
 
+    async def get_authoritative_job(
+        self, job_id: str, *, user_id: str, request_id: str = "", session_id: str = "",
+    ) -> dict[str, Any] | None:
+        """Query with explicit trusted ownership, independent of bound tool contexts."""
+        route = CronToolRoute(user_id=user_id, request_id=request_id, session_id=session_id, channel_id="")
+        route_token = self._cron_tools.push_cron_route(route)
+        try:
+            job = await self._cron_tools.get_authoritative_job(job_id)
+        finally:
+            self._cron_tools.reset_cron_route(route_token)
+        if job is None:
+            return None
+        if str(job.get("user_id") or "").strip() != user_id:
+            raise RuntimeError("authoritative cron job owner mismatch")
+        return self._to_backend_job(job)
+
     async def create_job(
         self,
         params: dict[str, Any],
@@ -248,6 +303,7 @@ class _CronToolsCronBackend(CronToolBackend):
             sorted(list((params or {}).keys())),
         )
         payload = _extract_legacy_params(dict(params or {}), context=context, require_schedule=True)
+        payload = self._inherit_session_mode(payload, context=context)
         # cron 的模型直接复用创建它的 chat-session 的模型配置（用户在对话中选用的
         # 模型，如免费模型 mimo-v2.5-free），保证 cron 执行与创建它的会话使用同一
         # 模型配置，而不是回退到 config 默认模型。
@@ -1035,3 +1091,13 @@ class CronRuntimeBridge:
                     allow_update,
                     [tool.card.name if hasattr(tool, 'card') else str(tool) for tool in tools])
         return tools
+
+
+async def query_authoritative_cron_job(
+    job_id: str, *, user_id: str, request_id: str = "", session_id: str = "",
+) -> dict[str, Any] | None:
+    """Query with explicit trusted ownership, independent of bound tool contexts."""
+    backend = _CronToolsCronBackend(CronTools())
+    return await backend.get_authoritative_job(
+        job_id, user_id=user_id, request_id=request_id, session_id=session_id,
+    )

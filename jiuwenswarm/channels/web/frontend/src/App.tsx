@@ -7,9 +7,8 @@ import { AssetPublishHost } from './components/AssetPublishDrawer';
  * 应用主布局，整合所有组件
  */
 
-import { useState, useCallback, useEffect, useRef, Component, ReactNode, useMemo, lazy, Suspense, type PointerEvent as ReactPointerEvent } from 'react';
+import { useState, useCallback, useEffect, useRef, Component, ReactNode, useMemo, lazy, Suspense, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react';
 import { ChatPanel } from './components/ChatPanel';
-import { SideConversationPanel } from './components/ChatPanel/SideConversationPanel';
 import { DesktopTextEditContextMenu } from './components/DesktopTextEditContextMenu';
 import { SessionSidebar } from './components/SessionSidebar';
 import { SkillPanel } from './components/SkillPanel';
@@ -27,7 +26,7 @@ import { ToolPanel } from './components/ToolPanel';
 import { UpdatePanel } from './components/UpdatePanel';
 import { ExternalCliInstallDialog, type ExternalCliInstallStatuses } from './components/ExternalCliInstallDialog';
 import { PersonalContextPanel } from './components/PersonalContext';
-import { ToastStack } from './components/ui';
+import { LoadingSpinner, ToastStack, toast } from './components/ui';
 import { SettingsPage } from './features/settings/SettingsPage';
 import type { SettingsPageDefinition } from './features/settings/registry/types';
 import type { SettingsRequest } from './features/settings/services/settingsContract';
@@ -60,8 +59,6 @@ import {
 } from './features/historyPagination';
 import { isPlanWireMode, resolvePlanWireMode } from './features/planMode/wireMode';
 import { queueOrAddGoalObjectiveMessage } from './features/goalPendingObjectiveBubble';
-import { LoginPage } from './features/auth/LoginPage';
-import { LogoutButton } from './features/auth/LogoutButton';
 import {
   normalizeToolCallPayload,
   normalizeToolResultPayload,
@@ -70,7 +67,6 @@ import { readAgentTemplateName } from './features/agentIdentity';
 import { normalizeTeamLeaderIdentity } from './features/teamLeaderIdentity';
 import { useWebSocket, mergePersistedGoalCompletionMessages, stampGoalObjectiveMessages, useResponsiveLayout, useResponsivePanelResize } from './hooks';
 import { webRequest } from './services/webClient';
-import { getArchiveErrorCode } from './features/workspace/archivedTaskClient';
 import type { WorkflowRun } from './components/teamArea/workflowTypes';
 import { useTeamPanelState } from './features/teamPanelState';
 import { useSingleAgentPanelState } from './features/singleAgentPanelState';
@@ -84,6 +80,7 @@ import {
   type MessageForkPoint,
   type Session,
 } from './types';
+import { parseModelGroups, parseModelSelection } from './features/settings/modules/models/modelGroupAdapters';
 import type { WorkMode } from './features/workspace/projectTypes';
 import {
   EXTERNAL_CLI_AGENT_KINDS,
@@ -175,6 +172,7 @@ import {
 } from './features/trajectory/SingleAgentSurface';
 import {
   shouldInsetTrajectoryForFloatingTasks,
+  trajectoryComposerClearance,
 } from './features/trajectory/trajectoryLayout';
 import {
   normalizeTrajectoryUiEnabled,
@@ -182,6 +180,7 @@ import {
   useTrajectoryUiEnabled,
 } from './features/trajectory/featureConfig';
 import './App.css';
+import { setTeamOrganizationUiEnabled } from './features/teamOrganization/featureConfig';
 
 const LazyTrajectoryPanel = lazy(async () => {
   const module = await import('./features/trajectory/TrajectoryPanel');
@@ -198,11 +197,6 @@ type ChatPanelResizeDrag = {
   containerWidth: number;
 };
 
-type SideConversationState = {
-  session: Session;
-  parentSessionId: string;
-  parentTitle: string;
-};
 const PREVIEW_MODEL_SETUP_GUIDE = import.meta.env.DEV
   && new URLSearchParams(window.location.search).get('modelSetupGuide') === '1';
 
@@ -394,6 +388,10 @@ function AppContent({
     return 'new';
   });
   const [chatSurfaceViews, setChatSurfaceViews] = useState<Record<string, ChatSurfaceView>>({});
+  // Whether the composer kept available on the trajectory view is collapsed to
+  // watch-only, per session, alongside which view that session last showed.
+  const [trajectoryComposerCollapsed, setTrajectoryComposerCollapsed] = useState<Record<string, boolean>>({});
+  const [trajectoryComposerHeight, setTrajectoryComposerHeight] = useState(0);
   const [chatWelcomeVariant, setChatWelcomeVariant] = useState<'group-create' | null>(null);
   const [trajectoryUiRequested, setTrajectoryUiRequested] = useState(false);
 
@@ -515,10 +513,9 @@ function AppContent({
   );
   /** 仅用于强制重跑「首屏 history」effect：从会话列表恢复时若 sessionId 未变，也要重新拉 history 并恢复 historyPagerMeta */
   const [historyBootstrapKey, setHistoryBootstrapKey] = useState(0);
-  const [sideConversation, setSideConversation] = useState<SideConversationState | null>(null);
-  const sideConversationRef = useRef<SideConversationState | null>(null);
   const sessionIdRef = useRef(sessionId);
   const sessionRestoreQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const sessionMetadataRequestsRef = useRef(new Map<string, Promise<Session | null>>());
   const sessionViewIdRef = useRef(generateUuidV4());
   const inputIntentSessionRef = useRef<string | null>(null);
   const historyLoadingSessionsRef = useRef(new Set<string>());
@@ -650,6 +647,7 @@ function AppContent({
   const {
     setCurrentSession,
     setAvailableModels,
+    setAvailableModelGroups,
     setMode,
     setTeamLeaderMemberIds,
   } = useSessionStore.getState();
@@ -668,7 +666,6 @@ function AppContent({
     const session = currentSession?.session_id === sessionId
       ? currentSession
       : sessions.find((item) => item.session_id === sessionId);
-    if (session?.ephemeral) return null;
     const sourceSessionId = session?.forked_from?.trim() ?? '';
     return sourceSessionId && sourceSessionId !== sessionId ? sourceSessionId : null;
   }, [currentSession, sessions, sessionId]);
@@ -702,6 +699,14 @@ function AppContent({
         ? current
         : { ...current, [sessionId]: nextView }
     ));
+  }, [sessionId]);
+  const composerDocked = chatSurfaceView === 'trajectory';
+  const composerCollapsed = trajectoryComposerCollapsed[sessionId] ?? false;
+  const toggleTrajectoryComposer = useCallback(() => {
+    setTrajectoryComposerCollapsed((current) => ({
+      ...current,
+      [sessionId]: !(current[sessionId] ?? false),
+    }));
   }, [sessionId]);
   const teamTaskEvents = useSessionStore((s) => s.runtimes[sessionId]?.teamTaskEvents ?? []);
   const teamTasks = useSessionStore((s) => s.runtimes[sessionId]?.teamTasks ?? []);
@@ -971,13 +976,13 @@ function AppContent({
   // 避免右侧面板与聊天面板平分空间导致宽度与集群模式不一致；auto_harness 走收起态分支。
   const panelExpanded = mode === 'team' ? teamAreaExpanded : singleAgentPanelExpanded;
   // 心跳面板打开时，团队/代码审核面板让出右侧工作区（两者互斥，不共同占用宽度）。
-  const isTeamAreaExpanded = mode !== 'auto_harness' && panelExpanded && toolPanelHasContent && !heartbeatPanelOpen && !toolPanelHidden && !sideConversation;
+  const isTeamAreaExpanded = mode !== 'auto_harness' && panelExpanded && toolPanelHasContent && !heartbeatPanelOpen && !toolPanelHidden;
 
   useEffect(() => {
-    if (panelExpanded && toolPanelHidden && !sideConversation) {
+    if (panelExpanded && toolPanelHidden) {
       setToolPanelHidden(false);
     }
-  }, [panelExpanded, sideConversation, toolPanelHidden, setToolPanelHidden]);
+  }, [panelExpanded, toolPanelHidden, setToolPanelHidden]);
 
   const { shouldFullscreen } = useResponsivePanelResize({
     isTeamAreaExpanded,
@@ -1004,6 +1009,7 @@ function AppContent({
     request,
     persistMedia,
     persistDocuments,
+    discardMedia,
     sendMessage,
     sendStructuredChatContent,
     pause,
@@ -1587,51 +1593,43 @@ function AppContent({
     }
   }, []);
 
-  const registerSideConversation = useCallback((session: Session): SideConversationState | null => {
-    const parentSessionId = session.side_parent_session_id?.trim() ?? '';
-    if (!session.ephemeral || !parentSessionId) return null;
-    const sessionStore = useSessionStore.getState();
-    const parent = sessionStore.sessions.find((item) => item.session_id === parentSessionId);
-    const state: SideConversationState = {
-      session,
-      parentSessionId,
-      parentTitle: toDisplaySessionTitle(parent?.title?.trim() || tRef.current('multiSession.untitled')),
-    };
-    sideConversationRef.current = state;
-    setSideConversation(state);
-    return state;
-  }, []);
-
-  const loadSessionMetadata = useCallback(async (targetSessionId: string): Promise<Session | null> => {
+  const fetchSessionMetadata = useCallback(async (targetSessionId: string): Promise<Session | null> => {
+    const queueSnapshot = useChatStore.getState().beginQueuedSessionMessageSnapshot(targetSessionId);
     try {
-      const session = await request<Session>('session.get_metadata', {
+      const response = await request<Session>('session.get_metadata', {
         session_id: targetSessionId,
       });
+      const { queued_session_messages: queuedMessages, ...session } = response;
       if ((session as unknown as Record<string, unknown>).archived === true) {
         if (sessionIdRef.current === targetSessionId) {
           navigate({ kind: 'chat-new' }, { replace: true });
         }
         return null;
       }
-      const isSideConversation = Boolean(session.ephemeral && session.side_parent_session_id?.trim());
-      if (isSideConversation) {
-        useSessionStore.getState().removeSession(targetSessionId);
-        if (sessionIdRef.current === targetSessionId) {
-          useSessionStore.getState().setCurrentSession(session);
-        }
-        registerSideConversation(session);
-      } else {
-        upsertSessionMetadata(session, { setCurrent: sessionIdRef.current === targetSessionId });
-        useWorkspaceStore.getState().upsertSession(session);
-        // is_processing 由 Gateway 在 session.get_metadata 响应入队前读取当前
-        // session 的运行态并覆盖，不是磁盘 metadata 的历史值。刷新页面时用这条
-        // 明确状态恢复停止按钮；之后同一 WebSocket 上的 processing_status 事件
-        // 继续按发送顺序推进状态机。
-        if (typeof session.is_processing === 'boolean') {
-          setProcessing(targetSessionId, session.is_processing);
-          if (!session.is_processing) {
-            setThinking(targetSessionId, false);
-          }
+      if (Array.isArray(queuedMessages)) {
+        useChatStore.getState().reconcileQueuedSessionMessageSnapshot(
+          targetSessionId,
+          queueSnapshot,
+          queuedMessages
+            .filter((message) => message.status === 'queued' && message.target_session_id === targetSessionId)
+            .map((message) => ({
+              messageId: message.message_id,
+              sourceSessionId: message.source_session_id,
+              sourceTitle: message.source_title,
+              content: message.content,
+            }))
+        );
+      }
+      upsertSessionMetadata(session, { setCurrent: sessionIdRef.current === targetSessionId });
+      useWorkspaceStore.getState().upsertSession(session);
+      // is_processing 由 Gateway 在 session.get_metadata 响应入队前读取当前
+      // session 的运行态并覆盖，不是磁盘 metadata 的历史值。刷新页面时用这条
+      // 明确状态恢复停止按钮；之后同一 WebSocket 上的 processing_status 事件
+      // 继续按发送顺序推进状态机。
+      if (typeof session.is_processing === 'boolean') {
+        setProcessing(targetSessionId, session.is_processing);
+        if (!session.is_processing) {
+          setThinking(targetSessionId, false);
         }
       }
       if (session.session_equipment && typeof session.session_equipment === 'object') {
@@ -1671,19 +1669,33 @@ function AppContent({
         // 同 handleRestoreSession：拿到后端 metadata 里的 model 后还原 selectedModelName，
         // 覆盖"targetSession 为空、走 loadSessionMetadata"这条恢复路径（如从 cron 触发
         // 会话列表点进来的占位 session 之后补全元数据的场景，bug002）。
-        if (session?.model) {
+        // Prefer stable model_selection when present; never restore a group from active_model/model name.
+        const restoredSelection = parseModelSelection(session?.model_selection);
+        if (restoredSelection) {
+          useSessionStore.getState().setSelectedModelSelection(targetSessionId, restoredSelection);
+        } else if (session?.model) {
           useSessionStore.getState().setSelectedModelName(targetSessionId, session.model);
         }
         // 恢复会话时同步 swarmflow 开关 + budget：后端 metadata 里的
         // session_swarmflow_config 是上次会话持久化的配置，刷新/重进后读回。
         const sfConfig = (session as unknown as Record<string, unknown> | null)?.session_swarmflow_config;
         if (sfConfig && typeof sfConfig === 'object') {
-          const cfg = sfConfig as { enable_swarmflow?: boolean; swarmflow_budget?: number | null };
+          const cfg = sfConfig as {
+            enable_swarmflow?: boolean;
+            swarmflow_budget?: number | null;
+            swarmflow_worktree?: boolean;
+          };
           if (cfg.enable_swarmflow) {
             useSessionStore.getState().setSwarmflowActive(
               targetSessionId,
               true,
               cfg.swarmflow_budget ?? undefined,
+            );
+          }
+          if (cfg.swarmflow_worktree !== undefined) {
+            useSessionStore.getState().setSwarmflowWorktree(
+              targetSessionId,
+              cfg.swarmflow_worktree,
             );
           }
         }
@@ -1696,7 +1708,27 @@ function AppContent({
       }
       return null;
     }
-  }, [navigate, registerSideConversation, request, setProcessing, setThinking, upsertSessionMetadata]);
+  }, [navigate, request, setProcessing, setThinking, upsertSessionMetadata]);
+
+  const handleContinueQueuedSessionMessages = useCallback(async (targetSessionId: string) => {
+    try {
+      await request('session.message.continue_queued', { session_id: targetSessionId });
+    } catch {
+      toast.open({ content: t('network.resumeFailed'), variant: 'error' });
+    }
+  }, [request, t]);
+
+  const loadSessionMetadata = useCallback((targetSessionId: string): Promise<Session | null> => {
+    const inFlight = sessionMetadataRequestsRef.current.get(targetSessionId);
+    if (inFlight) return inFlight;
+    const pending = fetchSessionMetadata(targetSessionId).finally(() => {
+      if (sessionMetadataRequestsRef.current.get(targetSessionId) === pending) {
+        sessionMetadataRequestsRef.current.delete(targetSessionId);
+      }
+    });
+    sessionMetadataRequestsRef.current.set(targetSessionId, pending);
+    return pending;
+  }, [fetchSessionMetadata]);
 
   // 获取服务端配置（通过 WS 方法）
   const fetchConfig = useCallback(async () => {
@@ -1705,6 +1737,7 @@ function AppContent({
       setA2UIFeatureEnabled(normalizeA2UIEnabled(config.a2ui_enabled));
       setRSIFeatureEnabled(normalizeRSIEnabled(config.rsi_enabled));
       setTrajectoryUiEnabled(normalizeTrajectoryUiEnabled(config.trajectory_ui_enabled));
+      setTeamOrganizationUiEnabled(config.team_organization_ui_enabled);
       setServerConfig(config);
       setConfigError(null);
       if (!modelSetupGuideEvaluatedRef.current) {
@@ -1719,16 +1752,17 @@ function AppContent({
       setServerConfig(null);
       setConfigError(t('app.configError'));
     }
-    // 同步获取多模型列表
+    // 同步获取多模型列表与模型组目录
     try {
-      const resp = await request<{ models: ModelEntry[]; active_model: string }>('models.list');
+      const resp = await request<{ models: ModelEntry[]; active_model: string; model_groups?: unknown }>('models.list');
       if (resp?.models) {
         setAvailableModels(resp.models, resp.active_model);
       }
+      setAvailableModelGroups(parseModelGroups(resp?.model_groups));
     } catch (error) {
       console.warn('Failed to fetch models list:', error);
     }
-  }, [request, t, setAvailableModels]);
+  }, [request, t, setAvailableModelGroups, setAvailableModels]);
 
   useEffect(() => {
     if (!FEATURE_APP_UPDATER_UI || !isConnected || startupUpdateCheckRef.current) {
@@ -1818,14 +1852,15 @@ function AppContent({
 
   const handleModelsRefresh = useCallback(async () => {
     try {
-      const resp = await request<{ models: ModelEntry[]; active_model: string }>('models.list');
+      const resp = await request<{ models: ModelEntry[]; active_model: string; model_groups?: unknown }>('models.list');
       if (resp?.models) {
         setAvailableModels(resp.models, resp.active_model);
       }
+      setAvailableModelGroups(parseModelGroups(resp?.model_groups));
     } catch (error) {
       console.warn('Failed to refresh models list:', error);
     }
-  }, [request, setAvailableModels]);
+  }, [request, setAvailableModelGroups, setAvailableModels]);
 
   useEffect(() => {
     const onAuthChanged = (event: Event) => {
@@ -2006,6 +2041,36 @@ function AppContent({
     restartSuccess,
   ]);
 
+  // 连接状态提示：断连期间在右上角挂一条常驻 toast（不自动消失），重连后收起；
+  // 携带业务 id，配置加载/语言切换导致文案变化时原地更新，始终只有一条。
+  const connectionToastKeyRef = useRef<number | null>(null);
+  const connectionStatusText = serverConfig ? t('connection.connecting') : t('connection.loadingConfig');
+  useEffect(() => {
+    if (isConnected) {
+      if (connectionToastKeyRef.current !== null) {
+        toast.close(connectionToastKeyRef.current);
+        connectionToastKeyRef.current = null;
+      }
+      return;
+    }
+    connectionToastKeyRef.current = toast.open({
+      // 保留旧 DOM 契约：外层 app-connection-toast 定位，内层 message 元素带
+      // data-variant="connecting|loadingConfig"；id 仅作业务去重键，不进 DOM
+      id: 'app-connection-toast-message',
+      content: (
+        <span data-testid="app-connection-toast-message" data-variant={serverConfig ? 'connecting' : 'loadingConfig'}>
+          {connectionStatusText}
+        </span>
+      ),
+      duration: 0,
+      position: 'right',
+      variant: 'info',
+      icon: <LoadingSpinner size={14} />,
+      closable: false,
+      testId: 'app-connection-toast',
+    });
+  }, [isConnected, connectionStatusText]);
+
   useEffect(() => {
     return () => {
       clearRestartAutoCloseTimer();
@@ -2087,7 +2152,7 @@ function AppContent({
       }
       void (async () => {
         const session = await loadSessionMetadata(sessionId);
-        if (session && !session.ephemeral) {
+        if (session) {
           useWorkspaceStore.getState().upsertSession(session);
         }
       })();
@@ -2385,6 +2450,19 @@ function AppContent({
           summaries: info.summaries,
         });
       },
+      onPendingQuestionReplay: (items) => {
+        // 防御性兜底：当前 materializeHistoryTimeline 把未答问题也渲染成只读
+        // qa.summary 卡片（不弹实时交互框——web 重连后后端不重发挂起中断，弹框 +
+        // resume 会报 "session has no active execution"），所以 pendingQuestionReplay
+        // 恒为空、本回调不会被触发。保留此钩子是为了将来后端支持重发挂起中断时
+        // 可直接重新启用，无需改接口。
+        const chatStore = useChatStore.getState();
+        chatStore.ensureRuntime(sessionId);
+        const sorted = [...items].sort((a, b) => (Date.parse(a.at) || 0) - (Date.parse(b.at) || 0));
+        for (const item of sorted) {
+          chatStore.enqueuePendingQuestion(sessionId, item.payload);
+        }
+      },
       onError: (message) => {
         console.warn('[history.restore]', message);
       },
@@ -2561,7 +2639,7 @@ function AppContent({
       currentMode: currentRuntime?.mode ?? mode,
       pending: newConversationPreviousSessionRef.current,
       newConversationId: NEW_CONVERSATION_ID,
-      clear: lifecycle.clearPreviousSession,
+      clear: lifecycle.clearPreviousSession || options.clearPreviousSession,
     });
     // 返回尚未发送的新建任务时，恢复该临时会话自己的模式和模型；真正开始一个新任务时，
     // 仍固定使用配置的默认模型，不继承当前正式会话手动切换过的模型。
@@ -2634,9 +2712,10 @@ function AppContent({
     setCurrentSession(null);
     setTeamAreaExpanded(false);
     setSingleAgentPanelExpanded(false);
+    // 删除/归档当前会话后 replace，避免后退回到已失效的 /chat/session/:id
     navigate(
       { kind: 'chat-new' },
-      options.replaceHistory ? { replace: true } : undefined,
+      (lifecycle.clearPreviousSession || options.clearPreviousSession) ? { replace: true } : undefined,
     );
     setActiveNav('chat');
     requestComposerFocus();
@@ -2767,7 +2846,11 @@ function AppContent({
         createParams.previous_session_id = previousSession.sessionId;
         createParams.previous_mode = previousSession.mode;
       }
-      if (runtimeSettings.selectedModelName) createParams.model_name = runtimeSettings.selectedModelName;
+      if (pendingRuntime?.selectedModelSelection) {
+        createParams.model_selection = pendingRuntime.selectedModelSelection;
+      } else if (runtimeSettings.selectedModelName) {
+        createParams.model_name = runtimeSettings.selectedModelName;
+      }
       if (workContext.project_id) createParams.project_id = workContext.project_id;
       if (workContext.project_dir) createParams.project_dir = workContext.project_dir;
 
@@ -2790,12 +2873,24 @@ function AppContent({
       (pendingRuntime?.enabledPlugins ?? []).forEach((id) => sessionStore.addEnabledPlugin(newSid, id));
       (pendingRuntime?.enabledMcps ?? []).forEach((name) => sessionStore.addEnabledMcp(newSid, name));
       if (pendingRuntime?.metadata) sessionStore.setSessionMetadata(newSid, pendingRuntime.metadata);
+      if (pendingRuntime?.selectedModelSelection) {
+        sessionStore.setSelectedModelSelection(newSid, pendingRuntime.selectedModelSelection);
+        void request('session.selection.set', {
+          session_id: newSid,
+          model_selection: pendingRuntime.selectedModelSelection,
+        }).catch((error) => {
+          console.warn('Failed to persist model selection for new session:', error);
+        });
+      }
       sessionStore.setAgentSelectionIntent(
         newSid,
         pendingRuntime?.agentSelectionIntent ?? { kind: 'keep' as const },
       );
       if (pendingRuntime?.enableSwarmflow) {
         sessionStore.setSwarmflowActive(newSid, true, pendingRuntime.swarmflowBudget);
+      }
+      if (pendingRuntime?.swarmflowWorktree !== undefined) {
+        sessionStore.setSwarmflowWorktree(newSid, pendingRuntime.swarmflowWorktree);
       }
       if (usePlanStore.getState().isActive(NEW_CONVERSATION_ID)) {
         usePlanStore.getState().setActive(newSid, true, {
@@ -2902,7 +2997,9 @@ function AppContent({
           createParams.previous_session_id = previousSession.sessionId;
           createParams.previous_mode = previousSession.mode;
         }
-        if (runtimeSettings.selectedModelName) {
+        if (newRuntime?.selectedModelSelection) {
+          createParams.model_selection = newRuntime.selectedModelSelection;
+        } else if (runtimeSettings.selectedModelName) {
           createParams.model_name = runtimeSettings.selectedModelName;
         }
         if (workContext.project_id) {
@@ -2936,6 +3033,15 @@ function AppContent({
           useSessionStore.getState().setSessionMetadata(newSid, pendingMetadata);
           useSessionStore.getState().setSessionMetadata(NEW_CONVERSATION_ID, null);
         }
+        if (newRuntime?.selectedModelSelection) {
+          useSessionStore.getState().setSelectedModelSelection(newSid, newRuntime.selectedModelSelection);
+          void request('session.selection.set', {
+            session_id: newSid,
+            model_selection: newRuntime.selectedModelSelection,
+          }).catch((error) => {
+            console.warn('Failed to persist model selection for new session:', error);
+          });
+        }
         // 同样搬家：欢迎页（'new'）上如果已经通过"+"菜单"扩展"面板开了某些插件/MCP 的会话内
         // 开关（或者是"使用"按钮带过来的 initialEnabledPlugins/initialEnabledMcps），真实
         // session_id 创建后要跟着过去，否则下面 removeRuntime('new') 会把这些选择直接冲掉。
@@ -2960,6 +3066,12 @@ function AppContent({
         const newConvSwarmflow = useSessionStore.getState().getRuntime(NEW_CONVERSATION_ID);
         if (newConvSwarmflow?.enableSwarmflow) {
           useSessionStore.getState().setSwarmflowActive(newSid, true, newConvSwarmflow.swarmflowBudget);
+        }
+        if (newConvSwarmflow?.swarmflowWorktree !== undefined) {
+          useSessionStore.getState().setSwarmflowWorktree(
+            newSid,
+            newConvSwarmflow.swarmflowWorktree,
+          );
         }
         pendingNewConversationRef.current = false;
         useSessionStore.getState().removeRuntime(NEW_CONVERSATION_ID);
@@ -3021,9 +3133,7 @@ function AppContent({
         sessionState.currentSession?.session_id === currentSessionId
           ? sessionState.currentSession
           : sessionState.sessions.find((item) => item.session_id === currentSessionId);
-      if (!session?.ephemeral) {
-        await useWorkspaceStore.getState().refreshSessionWorkspace(session);
-      }
+      await useWorkspaceStore.getState().refreshSessionWorkspace(session);
     } else {
       useChatStore.getState().setInputValue(currentSessionId, content);
     }
@@ -3036,6 +3146,13 @@ function AppContent({
     }
     return persistMedia(content, currentSessionId, mediaItems);
   }, [persistMedia]);
+
+  const handleDiscardMedia = useCallback((sessionId: string, path: string) => {
+    if (!sessionId || sessionId === NEW_CONVERSATION_ID || !path) {
+      return Promise.resolve();
+    }
+    return discardMedia(sessionId, path);
+  }, [discardMedia]);
 
   const handlePersistDocuments = useCallback((content: string, mediaItems: MediaItem[]) => {
     const currentSessionId = sessionIdRef.current;
@@ -3207,6 +3324,12 @@ function AppContent({
         resetHarnessStore(targetSessionId);
         historyRestoreFromPanelHintRef.current = true;
       }
+      if (options?.skipHistoryLoad) {
+        // The session returned by cron.run_now can precede its first persisted
+        // message. The sessionId effect must skip its initial history request too.
+        useChatStore.getState().setNewSession(targetSessionId, true);
+        historyRestoreFromPanelHintRef.current = false;
+      }
       // 确保 session runtime 存在；否则 useSessionStore.setMode 会因找不到 runtime 而直接跳过，
       // 导致从会话页签恢复后前端 mode 不会切换到目标会话对应的 mode。
       ensureSessionRuntimes(targetSessionId);
@@ -3217,7 +3340,11 @@ function AppContent({
         // 会话打开时若后端 metadata 带 model（首条 chat.send 显式携带 model_name 时
         // 由后端落盘），写进 runtime.selectedModelName——单 Agent 与集群（team）会话
         // 同样恢复，保证刷新页面后模型选择不回退到默认模型。
-        if (targetSession.model) {
+        // Prefer stable model_selection when present; never restore a group from active_model/model name.
+        const restoredSelection = parseModelSelection(targetSession.model_selection);
+        if (restoredSelection) {
+          useSessionStore.getState().setSelectedModelSelection(targetSessionId, restoredSelection);
+        } else if (targetSession.model) {
           useSessionStore.getState().setSelectedModelName(targetSessionId, targetSession.model);
         }
       } else {
@@ -3313,13 +3440,27 @@ function AppContent({
 
       const sourceSessionStore = useSessionStore.getState();
       const sourceSession = sourceSessionStore.sessions.find((session) => session.session_id === sourceSessionId);
-      const sourceMode = sourceSession?.mode ?? sourceSessionStore.getRuntime(sourceSessionId)?.mode ?? mode;
+      const sourceRuntime = sourceSessionStore.getRuntime(sourceSessionId);
+      const sourceMode = sourceSession?.mode ?? sourceRuntime?.mode ?? mode;
+      const equipmentOverride: { agent_template_name?: string; plugin_names?: string[]; mcp?: string[] } = {};
+      if (sourceRuntime?.agentSelectionIntent.kind === 'select') {
+        equipmentOverride.agent_template_name = sourceRuntime.agentSelectionIntent.id;
+      } else if (sourceRuntime?.agentSelectionIntent.kind === 'clear') {
+        equipmentOverride.agent_template_name = '';
+      }
+      if (sourceRuntime?.extensionsHydrated) {
+        equipmentOverride.plugin_names = sourceRuntime.enabledPlugins;
+        equipmentOverride.mcp = sourceRuntime.enabledMcps;
+      }
       const result = await request<{ session_id?: string }>(
         'session.fork',
         {
           session_id: sourceSessionId,
           source_session_id: sourceSessionId,
           mode: sourceMode,
+          ...(Object.keys(equipmentOverride).length > 0
+            ? { session_equipment_override: equipmentOverride }
+            : {}),
           ...(forkPoint
             ? {
                 fork_point: {
@@ -3337,143 +3478,19 @@ function AppContent({
       if (!forkSessionId) {
         throw new Error('session.fork did not return a session id');
       }
+      if (useGoalStore.getState().getRuntime(sourceSessionId)?.armed) {
+        useGoalStore.getState().setArmed(forkSessionId, true);
+      }
       await handleRestoreSession(forkSessionId, sourceMode);
     },
     [handleRestoreSession, mode, request],
   );
 
-  const removeSideConversationLocally = useCallback((sideSessionId: string) => {
-    disposeInFlightHistoryHandles(sideSessionId);
-    sessionIdsCreatedInThisPageRef.current.delete(sideSessionId);
-    useSessionStore.getState().removeSession(sideSessionId);
-    useSessionStore.getState().removeRuntime(sideSessionId);
-    useChatStore.getState().removeRuntime(sideSessionId);
-    useSubagentStore.getState().removeRuntime(sideSessionId);
-    useTodoStore.getState().removeRuntime(sideSessionId);
-    useHarnessStore.getState().removeRuntime(sideSessionId);
-    useGoalStore.getState().removeRuntime(sideSessionId);
-    sideConversationRef.current = null;
-    setSideConversation(null);
-  }, [disposeInFlightHistoryHandles]);
-
-  const deleteSideConversation = useCallback(async (sideSessionId: string): Promise<void> => {
-    await request('session.delete', { session_id: sideSessionId });
-    removeSideConversationLocally(sideSessionId);
-  }, [removeSideConversationLocally, request]);
-
-  const handleStartSideConversation = useCallback(async (
-    sourceSessionId: string,
-    initialPrompt?: string,
-  ): Promise<void> => {
-    if (!sourceSessionId || sourceSessionId === NEW_CONVERSATION_ID) {
-      throw new Error('A persisted session is required for a side conversation');
-    }
-    if (sideConversationRef.current) {
-      throw new Error('A side conversation is already open');
-    }
-
-    const sessionStore = useSessionStore.getState();
-    const sourceSession = sessionStore.currentSession?.session_id === sourceSessionId
-      ? sessionStore.currentSession
-      : sessionStore.sessions.find((item) => item.session_id === sourceSessionId);
-    const sourceRuntime = sessionStore.getRuntime(sourceSessionId);
-    const sourceMode = sourceSession?.mode ?? sourceRuntime?.mode ?? mode;
-    const result = await request<{
-      session_id?: string;
-      title?: string;
-      ephemeral?: boolean;
-    }>(
-      'session.fork',
-      {
-        session_id: sourceSessionId,
-        source_session_id: sourceSessionId,
-        mode: sourceMode,
-        side_conversation: true,
-      },
-      { timeoutMs: 60_000 },
-    );
-    const sideSessionId = typeof result.session_id === 'string' ? result.session_id.trim() : '';
-    if (!sideSessionId) {
-      throw new Error('session.fork did not return a side session id');
-    }
-
-    const now = new Date().toISOString();
-    const sideSession: Session = {
-      session_id: sideSessionId,
-      title: result.title?.trim() || 'Side chat',
-      project_id: sourceSession?.project_id ?? '',
-      project_dir: sourceSession?.project_dir ?? '',
-      work_mode: sourceSession?.work_mode,
-      mode: sourceMode as AgentMode,
-      status: 'active',
-      message_count: 0,
-      created_at: now,
-      updated_at: now,
-      model: sourceSession?.model ?? sourceRuntime?.selectedModelName ?? undefined,
-      session_equipment: sourceSession?.session_equipment,
-      forked_from: sourceSessionId,
-      ephemeral: true,
-      side_parent_session_id: sourceSessionId,
-    };
-    const registered = registerSideConversation(sideSession);
-    if (!registered) {
-      await request('session.delete', { session_id: sideSessionId });
-      throw new Error('invalid side conversation metadata');
-    }
-
-    sessionIdsCreatedInThisPageRef.current.add(sideSessionId);
-    ensureSessionRuntimes(sideSessionId);
-    const nextSessionStore = useSessionStore.getState();
-    nextSessionStore.setMode(sideSessionId, sourceMode as AgentMode);
-    nextSessionStore.setProjectDirectory(sideSessionId, sourceRuntime?.projectDirectory ?? sourceSession?.project_dir ?? null);
-    if (sourceRuntime?.selectedModelName) {
-      nextSessionStore.setSelectedModelName(sideSessionId, sourceRuntime.selectedModelName);
-    }
-    if (sourceRuntime) {
-      sourceRuntime.enabledPlugins.forEach((pluginId) => nextSessionStore.addEnabledPlugin(sideSessionId, pluginId));
-      sourceRuntime.enabledMcps.forEach((mcpName) => nextSessionStore.addEnabledMcp(sideSessionId, mcpName));
-      nextSessionStore.setAgentSelectionIntent(sideSessionId, sourceRuntime.agentSelectionIntent);
-    }
-    useChatStore.getState().ensureRuntime(sideSessionId);
-    useChatStore.getState().clearMessages(sideSessionId);
-
-    const prompt = initialPrompt?.trim();
-    if (prompt) {
-      await sendMessage(prompt, sideSessionId);
-    }
-  }, [mode, registerSideConversation, request, sendMessage]);
-
-  const handleSendSideConversationMessage = useCallback(async (content: string): Promise<boolean> => {
-    const side = sideConversationRef.current;
-    if (!side) return false;
-    return sendMessage(content, side.session.session_id);
-  }, [sendMessage]);
-
-  const handleCloseSideConversation = useCallback(async (): Promise<void> => {
-    const side = sideConversationRef.current;
-    if (!side) return;
-    try {
-      await deleteSideConversation(side.session.session_id);
-    } catch (error) {
-      console.error('Failed to close side conversation:', error);
-      window.alert(t(getArchiveErrorCode(error) === 'SESSION_BUSY'
-        ? 'multiSession.project.errors.deleteSessionBusy'
-        : 'multiSession.errors.delete'));
-    }
-  }, [deleteSideConversation, t]);
-
-  useEffect(() => {
-    const side = sideConversationRef.current;
-    if (!side || sessionId === side.parentSessionId) {
+  const requestSessionNavigation = useCallback((target: Session | 'new', options?: NewConversationOptions) => {
+    if (target === 'new') {
+      enterNewConversation(mode, options, { clearPreviousSession: options?.clearPreviousSession });
       return;
     }
-    void deleteSideConversation(side.session.session_id).catch((error) => {
-      console.warn('Failed to discard side conversation after navigation:', error);
-    });
-  }, [deleteSideConversation, sessionId]);
-
-  const requestSessionNavigation = useCallback((target: Session | 'new', options?: NewConversationOptions) => {
-    if (target === 'new') { enterNewConversation(mode, options); return; }
     if (isToolPanelAutoHideViewport) {
       setTeamAreaExpanded(false);
       setSingleAgentPanelExpanded(false);
@@ -3636,6 +3653,14 @@ function AppContent({
     shareExportMonitorTokensRef.current.set(currentSessionId, token);
     setShareExportSessionActive(currentSessionId, true);
     try {
+      if (window.jiuwenDesktop?.isElectron) {
+        const saved = await window.jiuwenDesktop.exportShareImage(
+          currentSessionId,
+          i18n.resolvedLanguage ?? i18n.language,
+        );
+        if (saved) showSaveToast();
+        return;
+      }
       const createResponse = await fetch('/share-api/jobs', {
         method: 'POST',
         cache: 'no-store',
@@ -3661,7 +3686,16 @@ function AppContent({
         setShareExportSessionActive(currentSessionId, false);
       }
     }
-  }, [i18n.language, i18n.resolvedLanguage, isPaused, isProcessing, monitorAndSaveShareImageJob, setShareExportSessionActive, t]);
+  }, [
+    i18n.language,
+    i18n.resolvedLanguage,
+    isPaused,
+    isProcessing,
+    monitorAndSaveShareImageJob,
+    setShareExportSessionActive,
+    showSaveToast,
+    t,
+  ]);
 
   const routeSessionMissing = routeSessionId !== null
     && initialDataLoaded
@@ -3750,7 +3784,14 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
                 {/* Chat Panel - 在展开时可拖拽调整宽度 */}
                 <div
                   className={`${showConversationNotFound || shouldFullscreen ? 'hidden' : 'flex'} chat-layout__surface  pt-0 flex-col ${effectiveTeamAreaExpanded ? '' : 'min-w-0'} min-h-0 ${effectiveTeamAreaExpanded ? '' : 'flex-1'}`}
-                  style={effectiveTeamAreaExpanded ? { width: `${chatPanelWidthPct}%` } : undefined}
+                  style={{
+                    ...(effectiveTeamAreaExpanded ? { width: `${chatPanelWidthPct}%` } : {}),
+                    '--trajectory-composer-clearance': `${trajectoryComposerClearance(
+                      composerDocked,
+                      composerCollapsed,
+                      trajectoryComposerHeight,
+                    )}px`,
+                  } as CSSProperties}
                   data-testid="app-chat-surface"
                 >
 <SingleAgentSurface
@@ -3759,14 +3800,13 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
                       <ChatPanel
                         onSendMessage={handleSendMessage}
                         onEnsureSession={ensureApplicationPluginSession}
-                        onNewSession={handleNewSession}
                         onForkSession={handleForkSession}
-                        onStartSideConversation={handleStartSideConversation}
                         continuedFromSessionId={continuedFromSessionId}
                         onOpenContinuedFromSession={handleOpenContinuedFromSession}
                         onInputIntent={handleSessionInputIntent}
                         onPersistMedia={handlePersistMedia}
                         onPersistDocuments={handlePersistDocuments}
+                        onDiscardMedia={handleDiscardMedia}
                         onInterrupt={handleInterrupt}
                         onCancel={handleCancel}
                         onSwitchMode={handleSwitchMode}
@@ -3803,6 +3843,11 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
                         onRefreshGoal={refreshGoal}
                         onClearGoal={handleClearGoal}
                         onDrainTaskQueueIfIdle={drainTaskQueueIfIdle}
+                        composerDocked={composerDocked}
+                        composerCollapsed={composerCollapsed}
+                        onToggleComposerCollapsed={toggleTrajectoryComposer}
+                        onComposerHeightChange={setTrajectoryComposerHeight}
+                        onContinueQueuedSessionMessages={handleContinueQueuedSessionMessages}
                       />
                     )}
                     chatLabel={t('nav.chat')}
@@ -3831,15 +3876,6 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
                   />
                 </div>
 
-                {sideConversation && sessionId === sideConversation.parentSessionId ? (
-                  <SideConversationPanel
-                    sessionId={sideConversation.session.session_id}
-                    parentTitle={sideConversation.parentTitle}
-                    onSendMessage={handleSendSideConversationMessage}
-                    onClose={() => { void handleCloseSideConversation(); }}
-                  />
-                ) : null}
-
                 {/* 可拖拽分割线 */}
                 {showWorkspaceDivider && (
                   <div
@@ -3858,7 +3894,7 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
                 )}
 
                 {/* Tool Panel / Expanded Team Panel */}
-                {!sideConversation && !toolPanelHidden && trajectoryTaskPanelAvailable && !showConversationNotFound && !heartbeatPanelOpen && (
+                {!toolPanelHidden && trajectoryTaskPanelAvailable && !showConversationNotFound && !heartbeatPanelOpen && (
                   <ToolPanel
                     sessionId={sessionId}
                     project={sessionProject}
@@ -3889,7 +3925,7 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
                 )}
 
                 {/* 心跳面板：跟 ToolPanel 一样占用右侧工作区一栏，而不是浮在页面上方的浮层 */}
-                {!sideConversation && heartbeatPanelOpen && sessionId && sessionId !== NEW_CONVERSATION_ID && !showConversationNotFound && (
+                {heartbeatPanelOpen && sessionId && sessionId !== NEW_CONVERSATION_ID && !showConversationNotFound && (
                   <HeartbeatPanel sessionId={sessionId} onClose={() => setHeartbeatPanelOpen(false)} />
                 )}
               </div>
@@ -4071,15 +4107,6 @@ const showWorkspaceDivider = effectiveTeamAreaExpanded && !showConversationNotFo
       {/* 全局命令式 toast 渲染出口（toast.open） */}
       <ToastStack />
 
-      {/* 连接状态提示 */}
-      {!isConnected && (
-        <div className="app-toast-wrapper app-toast-wrapper--top" data-testid="app-connection-toast">
-          <div className="app-connection-toast animate-rise" data-testid="app-connection-toast-message" data-variant={serverConfig ? 'connecting' : 'loadingConfig'}>
-            {serverConfig ? t('connection.connecting') : t('connection.loadingConfig')}
-          </div>
-        </div>
-      )}
-
       {saveToastVisible && (
         <div className="app-toast-wrapper app-toast-wrapper--top-center" data-testid="app-save-toast">
           <div className="app-session-toast animate-rise" data-testid="app-save-toast-message">
@@ -4212,98 +4239,9 @@ function App({
         settingsPageDefinition={settingsPageDefinition}
         resolveSettingsRequest={resolveSettingsRequest}
       />
+      <AssetPublishHost />
     </ErrorBoundary>
   );
 }
 
-/**
- * 鉴权外壳: 进入前探测 cookie 是否携带有效 access_token + 是否一体机模式。
- * - GET /api/web-config: 本地端点, 拿 {remote: bool, iam_enabled: bool}
- *   - iam_enabled=false: 未配置 IAM, 无鉴权, 直接渲染主 App
- *   - iam_enabled=true: 配置了 IAM, 继续探测登录态
- * - GET /auth-api/v1/auth/permissions (同源, 浏览器自动带 HttpOnly cookie)
- *   - 200 -> 已登录, 渲染主 App (+ 一体机模式时浮 LogoutButton)
- *   - 401/其他 -> 未登录, 渲染 LoginPage
- * control-panel 只认 Authorization: Bearer, app_web.py 的 _proxy_auth_http
- * 会从 jw_token cookie 取 token 注入头, 故前端只需同源请求。
- */
-function AppWithAuth({
-  settingsPageDefinition,
-  resolveSettingsRequest,
-}: {
-  settingsPageDefinition: SettingsPageDefinition;
-  resolveSettingsRequest: (openSourceRequest: SettingsRequest) => SettingsRequest;
-}) {
-  const [authStatus, setAuthStatus] = useState<'checking' | 'loggedOut' | 'loggedIn' | 'noIam'>('checking');
-  const [remote, setRemote] = useState(false);
-
-  useEffect(() => {
-    if (window.jiuwenDesktop?.isElectron) {
-      setAuthStatus('noIam');
-      return;
-    }
-    let cancelled = false;
-    // 先拿 web-config: 如果 iam_enabled=false, 直接跳过鉴权探测
-    fetch('/api/web-config', { credentials: 'same-origin' })
-      .then((r) => r.json())
-      .then((cfg) => {
-        if (cancelled) return;
-        if (cfg && typeof cfg.remote === 'boolean') setRemote(cfg.remote);
-        if (cfg && cfg.iam_enabled === false) {
-          setAuthStatus('noIam');
-          return;
-        }
-        // IAM 已配置, 探测登录态
-        fetch('/auth-api/v1/auth/permissions', { credentials: 'same-origin' })
-          .then((resp) => {
-            if (cancelled) return;
-            if (resp.ok) {
-              setAuthStatus('loggedIn');
-            } else {
-              setAuthStatus('loggedOut');
-            }
-          })
-          .catch(() => {
-            if (!cancelled) setAuthStatus('loggedOut');
-          });
-      })
-      .catch(() => {
-        // web-config 获取失败, 回退到探测登录态
-        fetch('/auth-api/v1/auth/permissions', { credentials: 'same-origin' })
-          .then((resp) => {
-            if (cancelled) return;
-            if (resp.ok) {
-              setAuthStatus('loggedIn');
-            } else {
-              setAuthStatus('loggedOut');
-            }
-          })
-          .catch(() => {
-            if (!cancelled) setAuthStatus('loggedOut');
-          });
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  if (authStatus === 'checking') {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-slate-900">
-        <div className="text-slate-400 text-sm">Loading…</div>
-      </div>
-    );
-  }
-  if (authStatus === 'loggedOut') {
-    return <LoginPage />;
-  }
-  return (
-    <>
-      {remote && <LogoutButton />}
-      <App settingsPageDefinition={settingsPageDefinition} resolveSettingsRequest={resolveSettingsRequest} />
-      <AssetPublishHost />
-    </>
-  );
-}
-
-export default AppWithAuth;
+export default App;

@@ -70,7 +70,7 @@ _MIGRATION_LOCK = threading.Lock()
 _PENDING_MIGRATIONS: set[tuple[str, str]] = set()
 _MAX_PENDING_MIGRATIONS = 64
 _COLLECT_LOCK = threading.Lock()
-_COLLECT_INFLIGHT: dict[tuple[str, str], Future] = {}
+_COLLECT_INFLIGHT: dict[tuple[str, str, bool], Future] = {}
 
 # 内存缓存: 解决异步写入时读取到陈旧磁盘数据的竞态条件
 _METADATA_CACHE: dict[str, dict[str, Any]] = {}
@@ -239,8 +239,6 @@ def _apply_metadata_defaults_with_inference(
     metadata.setdefault("pinned", False)
     metadata.setdefault("pin_order", 0)
     metadata.setdefault("status", "idle")
-    metadata.setdefault("ephemeral", False)
-    metadata.setdefault("side_parent_session_id", "")
 
     changed = False  # 是否有需要写盘的确定性推断
     changed_fields: set[str] = set()
@@ -596,7 +594,8 @@ def _write_metadata_unfenced(
         # and friends (writes replace the whole file, they do not merge). When
         # disk has an identity and the incoming payload does not, treat it as a
         # race-induced dirty write and restore the missing fields.
-        if current and current.get("session_id") and not metadata.get("session_id"):
+        needs_identity_recovery = options.merge_fields is None and current and current.get("session_id")
+        if needs_identity_recovery and not metadata.get("session_id"):
             recovered = {k: v for k, v in current.items() if k not in metadata}
             to_write = {**current, **metadata}
             logger.warning(
@@ -607,6 +606,15 @@ def _write_metadata_unfenced(
 
         if options.preserve_pin_fields and current is not None:
             to_write = _merge_pin_fields(current, to_write)
+        # Selection has its own authoritative field update. Queued history/title
+        # snapshots must not roll a newer selection back (including a clear).
+        owns_selection = options.merge_fields is not None and "model_selection" in options.merge_fields
+        if current is not None and not owns_selection:
+            to_write = dict(to_write)
+            if "model_selection" in current:
+                to_write["model_selection"] = current["model_selection"]
+            else:
+                to_write.pop("model_selection", None)
         # 权威 rebind 版本检查: 持锁后重比 gen, 判定调用方传入的快照是否已陈旧。
         # 比调用方持锁前的 pre-check 更可靠 —— 消除"gen 比较与文件写入"之间的
         # TOCTOU 窗口(P3)。rebind 自身传入的 gen 已 bump, 等于当前 gen, 不触发合并。
@@ -629,6 +637,20 @@ def _write_metadata_unfenced(
             tmp.unlink(missing_ok=True)
             raise
     return to_write
+
+
+def update_session_model_selection(
+    session_id: str, selection: dict[str, Any], *, expected_selection: tuple[bool, Any] | None = None,
+) -> None:
+    """Update only selection through the shared lifecycle/atomic-write boundary."""
+    _write_metadata_sync(
+        session_id, {"model_selection": selection},
+        _MetadataWriteOptions(
+            merge_fields=frozenset({"model_selection"}),
+            expected_fields={"model_selection": expected_selection} if expected_selection is not None else None,
+        ),
+    )
+    remove_session_metadata_cache(session_id)
 
 
 def _merge_pin_fields(current: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any]:
@@ -1180,6 +1202,21 @@ def sync_session_request_metadata(
     metadata = _read_metadata(session_id, cache_bust=True)
     effective_project_dir: str | None = None
 
+    from jiuwenswarm.common.agentos_runtime import is_agentos_workspace_fallback
+
+    workspace_fallback = is_agentos_workspace_fallback(
+        channel_id=channel_id,
+        project_dir=project_dir,
+        project_id=project_id,
+    )
+    stored_project_id = str((metadata or {}).get("project_id") or "").strip()
+    stored_project_dir = str((metadata or {}).get("project_dir") or "").strip().rstrip("/")
+    if stored_project_id not in {"", "default", "default_code"} or stored_project_dir not in {
+        "", "/home/agentos/workspace",
+    }:
+        workspace_fallback = False
+    binding_project_dir = None if workspace_fallback else project_dir
+
     if not metadata:
         # 会话元数据不存在：兜底新建（外部渠道隐式创建 session 的场景）
         now = _current_timestamp()
@@ -1201,7 +1238,7 @@ def sync_session_request_metadata(
             "team_name": "",
             "team_template_id": "",
             "round_id": 0,
-            "project_dir": project_dir or "",
+            "project_dir": binding_project_dir or "",
             "project_id": project_id or "",
             "persist_session": persist_session if isinstance(persist_session, bool) else False,
             "model": model if (model is not None and explicit_model_provided) else "",
@@ -1248,7 +1285,11 @@ def sync_session_request_metadata(
 
         # 校验 project_dir：首次锁定 / 不一致告警不覆盖
         locked_project = metadata.get("project_dir")
-        if isinstance(locked_project, str) and locked_project.strip():
+        if workspace_fallback:
+            # Execution cwd only: do not persist a project association or treat
+            # an old fallback directory as a newly requested binding.
+            effective_project_dir = project_dir
+        elif isinstance(locked_project, str) and locked_project.strip():
             # 已锁定：以磁盘值为准
             effective_project_dir = locked_project.strip()
             # 请求带了不同值 → 告警（会话被换项目目录，有问题），但不覆盖
@@ -1388,6 +1429,12 @@ def save_session_equipment(
         "plugin_names": _normalize_session_equipment_names(plugin_names),
         "mcp": _normalize_session_equipment_names(mcp),
     }
+    if get_session_equipment(session_id, cache_bust=True) == snapshot:
+        return
+    # The first user record may still be queued. A synchronous equipment
+    # update from the older disk snapshot would erase its title and count.
+    if not flush_pending_writes():
+        raise RuntimeError("session metadata writes did not finish before equipment update")
     if get_session_equipment(session_id, cache_bust=True) == snapshot:
         return
     update_session_metadata(
@@ -1935,9 +1982,11 @@ def get_all_sessions_metadata(
 
 def collect_all_sessions_metadata(
     user_id: str | None = None,
+    *,
+    enable_writeback: bool = True,
 ) -> list[dict[str, Any]]:
-    """Share only overlapping scans; later requests still read fresh disk state."""
-    key = (str(get_agent_sessions_dir()), user_id or "")
+    """Share overlapping scans with the same metadata writeback policy."""
+    key = (str(get_agent_sessions_dir()), user_id or "", enable_writeback)
     with _COLLECT_LOCK:
         pending = _COLLECT_INFLIGHT.get(key)
         owner = pending is None
@@ -1947,7 +1996,11 @@ def collect_all_sessions_metadata(
     if not owner:
         return copy.deepcopy(pending.result())
     try:
-        result = _collect_all_sessions_metadata(user_id)
+        result = (
+            _collect_all_sessions_metadata(user_id)
+            if enable_writeback
+            else _collect_all_sessions_metadata(user_id, enable_writeback=False)
+        )
         pending.set_result(result)
         return copy.deepcopy(result)
     except BaseException as exc:
@@ -1972,6 +2025,8 @@ def _apply_batch_projection(
 
 def _collect_all_sessions_metadata(
     user_id: str | None = None,
+    *,
+    enable_writeback: bool = True,
 ) -> list[dict[str, Any]]:
     """收集全部会话元数据(不分页、不排序),供项目统计与置顶会话聚合使用。
 
@@ -2052,7 +2107,9 @@ def _collect_all_sessions_metadata(
                 dir_to_projects=dir_to_projects,
                 id_to_work_mode=id_to_work_mode,
                 enable_writeback=False,
-                background_writeback=not user_id and not state.get("write_blocked"),
+                background_writeback=(
+                    enable_writeback and not user_id and not state.get("write_blocked")
+                ),
             )
         if meta.get("ephemeral") is True:
             continue

@@ -22,6 +22,9 @@ from openjiuwen.agent_teams import observability as team_observability
 from openjiuwen.core.runner import Runner
 from openjiuwen.core.common.logging import server_logger
 from openjiuwen.harness import DeepAgent
+from openjiuwen.harness_protocol.state import HarnessState
+from openjiuwen.core.foundation.llm import CompiledModelSelection
+from openjiuwen.agent_teams.models.pool import materialize_model_group
 from openjiuwen.harness.rails import (
     EvolutionInterruptRail,
     SkillEvolutionRail,
@@ -36,6 +39,7 @@ from jiuwenswarm.common.cron_team_completion import (
     new_cron_team_round_state,
 )
 from jiuwenswarm.common.log_preview import preview_text
+from jiuwenswarm.common.model_selection import ModelSelection as SwarmModelSelection
 from jiuwenswarm.common.utils import get_user_workspace_dir
 
 configure_agent_teams_home()
@@ -244,6 +248,13 @@ class _ActiveTeamRound:
     release_admission: Callable[[], Awaitable[None]] | None = None
     defer_terminal_release: bool = False
     terminal_armed: bool = False
+    # 本回合见证过 swarmflow 终态事件（workflow.updated 转入 completed/failed/
+    # stopped）。收尾探测据此区分「本回合正在汇报 flow 结果」与「上一回合遗留
+    # 的终态 run」；标记随回合对象生灭，不跨回合。
+    saw_flow_terminal: bool = False
+    # Terminal replays must not hide execution that continued after the flow.
+    continued_after_flow: bool = False
+    open_archive_tasks: set[str] = field(default_factory=set)
     completion_state: dict[str, Any] = field(
         default_factory=new_cron_team_round_state
     )
@@ -515,6 +526,29 @@ class TeamManager:
             return
         if not terminal and current_round is not None:
             current_round.terminal_armed = True
+        if current_round is not None and self._is_workflow_terminal_event(event):
+            # 见证即记录：无论有没有 waiter，本回合看到 flow 终态就置位，
+            # 收尾探测（team_round_finishing_after_flow）据此关联回合与 run。
+            current_round.saw_flow_terminal = True
+        if current_round is not None:
+            if event_type == "team.task":
+                task = event.get("event")
+                if isinstance(task, dict) and task.get("task_id"):
+                    task_id = str(task["task_id"])
+                    status = task.get("status")
+                    task_type = str(task.get("type") or "")
+                    if status in {"completed", "cancelled", "failed"} or task_type.endswith(
+                        (".completed", ".cancelled", ".verified")
+                    ):
+                        current_round.open_archive_tasks.discard(task_id)
+                    elif status or task_type.endswith((".created", ".started", ".claimed")):
+                        current_round.open_archive_tasks.add(task_id)
+                        if current_round.saw_flow_terminal:
+                            current_round.continued_after_flow = True
+            if current_round.saw_flow_terminal and event_type in {
+                "chat.tool_call", "chat.ask_user_question",
+            }:
+                current_round.continued_after_flow = True
 
         waiters = list(self._pending_waiters.get(session_id, ()))
         exclusive_request_id = self._exclusive_waiters.get(session_id)
@@ -762,6 +796,16 @@ class TeamManager:
         """Return whether a Team round, rather than its transport, is active."""
         return session_id in self._active_rounds
 
+    def round_can_finish_after_flow(self, session_id: str) -> bool:
+        """Whether the round saw a flow end without outstanding or subsequent work."""
+        current = self._active_rounds.get(session_id)
+        return (
+            current is not None
+            and current.saw_flow_terminal
+            and not current.continued_after_flow
+            and not current.open_archive_tasks
+        )
+
     def is_round_owner(self, session_id: str, request_id: str) -> bool:
         current = self._active_rounds.get(session_id)
         return current is not None and current.request_id == request_id
@@ -865,6 +909,16 @@ class TeamManager:
             controller = BackgroundTaskController()
             self._background_task_controllers[session_id] = controller
         return controller
+
+    def find_background_task_controller(
+        self, session_id: str
+    ) -> BackgroundTaskController | None:
+        """The session's controller when one already exists, else None.
+
+        Read-only companion of :meth:`get_background_task_controller`: state
+        checks must not lazily seed the registry with an empty controller.
+        """
+        return self._background_task_controllers.get(session_id)
 
     def has_swarmflow_runs(self, session_id: str) -> bool:
         """Whether the session's controller still holds active or paused runs.
@@ -1031,6 +1085,159 @@ class TeamManager:
         )
 
     @staticmethod
+    def _resolve_and_compile_team_selection(
+        selection: SwarmModelSelection,
+    ) -> CompiledModelSelection:
+        """Resolve a stable Team selection through the server-side boundary."""
+        from jiuwenswarm.common.model_errors import (
+            TEAM_MODEL_SELECTION_STALE,
+            ModelSelectionError,
+        )
+        from jiuwenswarm.server.runtime.model_compiler_adapter import (
+            compile_model_selection,
+        )
+        from jiuwenswarm.server.runtime.model_routing_registry import (
+            ModelSelectionResolver,
+        )
+
+        try:
+            resolved = ModelSelectionResolver().resolve(
+                SwarmModelSelection(
+                    type=selection.type,
+                    id=selection.id,
+                    route_id=selection.route_id,
+                )
+            )
+            compiled = compile_model_selection(resolved)
+        except ModelSelectionError:
+            # Stable catalog / permission failures are meaningful to callers.
+            raise
+        except Exception as exc:
+            # Foundation errors also expose a numeric ``code`` attribute, but
+            # those values are implementation details rather than Team's
+            # stable external contract.
+            raise ModelSelectionError(
+                TEAM_MODEL_SELECTION_STALE,
+                "Team model selection cannot be restored; choose a model again",
+                selection_type=selection.type,
+            ) from exc
+
+        return compiled
+
+    @staticmethod
+    def _apply_compiled_team_selection(
+        spec_dict: dict[str, Any],
+        selection: SwarmModelSelection,
+        compiled: CompiledModelSelection,
+    ) -> None:
+        """Materialize one compiled selection into the Team model pool."""
+        from jiuwenswarm.common.model_errors import (
+            MODEL_REQUEST_CONFIG_INVALID,
+            TEAM_MODEL_SELECTION_STALE,
+            ModelSelectionError,
+        )
+
+        if (
+            compiled.selected_type != selection.type
+            or compiled.selected_id != selection.id
+        ):
+            raise ModelSelectionError(
+                TEAM_MODEL_SELECTION_STALE,
+                "model selection does not match compiled selection",
+            )
+
+        # ``load_team_spec_dict`` normally supplies the leader object, but
+        # callers may provide a minimal/template snapshot without one.  Keep
+        # model selection authoritative in that case too; Pydantic will fill
+        # the remaining LeaderSpec defaults when the spec is validated.
+        leader = spec_dict.get("leader")
+        if not isinstance(leader, dict):
+            leader = {}
+            spec_dict["leader"] = leader
+        # The compiled selection is the sole authoritative model source for
+        # this build. Remove stale convenience router declarations from an
+        # older template before TeamAgentSpec validates mutual exclusion.
+        spec_dict["model_router"] = None
+        spec_dict["model_intelli_router"] = None
+        client = compiled.model_client_config
+        provider = getattr(client, "client_provider", "")
+        provider = getattr(provider, "value", provider)
+        if selection.type == "model_group" and str(provider) == "intelli_router":
+            spec_dict["model_pool"] = [
+                entry.model_dump(exclude_none=True)
+                for entry in materialize_model_group(compiled, selection)
+            ]
+            spec_dict["model_pool_strategy"] = "intelli_router"
+            # The compiled selection is authoritative. Clear convenience
+            # sources from a legacy template and normalize every predefined
+            # member to the sole logical Team entry; physical deployment names
+            # stay inside the Foundation router.
+            spec_dict["model_router"] = None
+            spec_dict["model_intelli_router"] = None
+            if isinstance(leader, dict):
+                leader["model_name"] = "*"
+            predefined_members = spec_dict.get("predefined_members")
+            if isinstance(predefined_members, list):
+                for member in predefined_members:
+                    # External CLI members must keep their physical
+                    # deployment hint; the CLI path resolves it through the
+                    # IntelliRouter deployment catalog. Ordinary Team
+                    # members use the single logical wildcard entry.
+                    if (
+                        isinstance(member, dict)
+                        and member.get("role_type") != "external_cli"
+                    ):
+                        member["model_name"] = "*"
+            return
+
+        client = client.model_dump(exclude_none=True)
+        request = (
+            compiled.model_request_config.model_dump(
+                exclude_none=True,
+                by_alias=True,
+            )
+            if compiled.model_request_config
+            else {}
+        )
+        name = request.get("model") or request.get("model_name") or ""
+        if not name:
+            raise ModelSelectionError(
+                MODEL_REQUEST_CONFIG_INVALID,
+                "compiled model selection has an empty model name",
+            )
+        provider = client.get("client_provider", "")
+        provider = getattr(provider, "value", provider)
+        spec_dict["model_pool"] = [
+            {
+                "model_name": name,
+                "api_key": client.get("api_key", ""),
+                "api_base_url": client.get("api_base", ""),
+                "api_provider": str(provider),
+                "metadata": {
+                    "client": {
+                        key: value
+                        for key, value in client.items()
+                        if key not in {"client_provider", "api_key", "api_base"}
+                    },
+                    "request": {
+                        key: value
+                        for key, value in request.items()
+                        if key not in {"model", "model_name"}
+                    },
+                },
+            }
+        ]
+        spec_dict["model_pool_strategy"] = "by_model_name"
+        # The stable selection is authoritative over stale template hints.
+        if isinstance(leader, dict):
+            leader["model_name"] = name
+
+    @staticmethod
+    def load_default_team_spec(session_id: str) -> TeamAgentSpec:
+        """Load the default Team specification for host organization adapters."""
+        return TeamManager._load_team_spec(session_id)
+
+    @staticmethod
     def _load_team_spec(
         session_id: str,
         *,
@@ -1039,6 +1246,7 @@ class TeamManager:
         template_id: str | None = None,
         template_snapshot: dict[str, Any] | None = None,
         strict_template: bool = False,
+        model_selection: SwarmModelSelection | dict[str, Any] | None = None,
     ) -> TeamAgentSpec:
         config_base = get_config()
         # Keep dependency checks scoped to distributed mode to make the
@@ -1073,6 +1281,30 @@ class TeamManager:
         spec_dict = TeamManager._normalize_team_identity_fields(spec_dict)
         if TeamManager._is_distributed_mode(config_base):
             spec_dict = TeamManager._normalize_distributed_transport_fields(config_base, spec_dict)
+
+        if model_selection is not None:
+            # Normalize through the swarm DTO so ``route_id`` (a valid
+            # group-scope pin) survives; the foundation ``ModelSelection``
+            # would silently drop it.
+            raw_selection = (
+                model_selection
+                if isinstance(model_selection, dict)
+                else model_selection.model_dump(exclude_none=True)
+            )
+            selection = SwarmModelSelection.model_validate(
+                {
+                    key: raw_selection[key]
+                    for key in ("type", "id", "route_id")
+                    if key in raw_selection
+                }
+            )
+            compiled = TeamManager._resolve_and_compile_team_selection(selection)
+            TeamManager._apply_compiled_team_selection(
+                spec_dict,
+                selection,
+                compiled,
+            )
+            return TeamAgentSpec.model_validate(spec_dict)
 
         # Populate the pool from valid configured entries plus the effective
         # page-selected model. The latter may be an in-memory Zen model or a
@@ -1163,6 +1395,7 @@ class TeamManager:
         *,
         requested_model_name: str | None = None,
         login_model_entry: dict[str, Any] | None = None,
+        model_selection: SwarmModelSelection | dict[str, Any] | None = None,
     ) -> tuple[TeamAgentSpec, bool]:
         team_name, template_id, template_snapshot = self._lookup_bound_team_identity(session_id)
         load_kwargs: dict[str, Any] = {}
@@ -1175,6 +1408,37 @@ class TeamManager:
             load_kwargs["strict_template"] = template_snapshot is None
         if template_snapshot is not None:
             load_kwargs["template_snapshot"] = template_snapshot
+        # A persisted selection is a business reference, not a runtime
+        # snapshot.  Re-resolve it on every cold build so config/credentials
+        # and permissions are current.
+        if model_selection is None:
+            metadata = get_session_metadata(session_id, cache_bust=True)
+            # Team bindings own the long-lived business selection.  Keep the
+            # session field as a read-only compatibility fallback for legacy
+            # sessions/checkpoints that predate Team-level persistence.
+            team_name = str(metadata.get("team_name") or "").strip()
+            if team_name:
+                try:
+                    from jiuwenswarm.server.runtime.team_binding_store import get_team_binding_store
+                    stored_team = get_team_binding_store().get_team_selection(team_name)
+                except Exception:
+                    stored_team = None
+                if isinstance(stored_team, dict) and stored_team.get("type") and stored_team.get("id"):
+                    model_selection = stored_team
+            if model_selection is None:
+                from jiuwenswarm.server.runtime.session.model_selection_store import (
+                    get_session_model_selection,
+                )
+
+                try:
+                    stored = get_session_model_selection(session_id)
+                except ValueError:
+                    stored = None
+                if stored is not None:
+                    model_selection = stored.model_dump(exclude_none=True)
+
+        if model_selection is not None:
+            load_kwargs["model_selection"] = model_selection
         spec = self._load_team_spec(session_id, **load_kwargs)
         if team_name:
             spec.team_name = team_name
@@ -1197,6 +1461,7 @@ class TeamManager:
         login_model_entry: dict[str, Any] | None = None,
         agent_group_name: str | None = None,
         swarmflow_config: dict | None = None,
+        model_selection: SwarmModelSelection | dict[str, Any] | None = None,
     ) -> TeamAgentSpec:
         """Build a team spec via provider-based assembly (no parent DeepAgent).
 
@@ -1230,6 +1495,7 @@ class TeamManager:
             session_id,
             requested_model_name=requested_model_name,
             login_model_entry=login_model_entry,
+            model_selection=model_selection,
         )
         if not has_binding:
             self._apply_session_scoped_team_name(spec, session_id=session_id)
@@ -1253,6 +1519,18 @@ class TeamManager:
                 spec.swarmflow_budget = budget
             else:
                 spec.swarmflow_budget = None
+            # Session-level worktree gate: True arms the manager, False withholds
+            # it, None (not specified) keeps the team config's worktree section.
+            worktree_flag = swarmflow_config.get("swarmflow_worktree")
+            if worktree_flag is True:
+                if spec.worktree is None:
+                    from openjiuwen.harness.tools.worktree import WorktreeConfig
+
+                    spec.worktree = WorktreeConfig(enabled=True)
+                elif not spec.worktree.enabled:
+                    spec.worktree = spec.worktree.model_copy(update={"enabled": True})
+            elif worktree_flag is False:
+                spec.worktree = None
         return spec
 
     @staticmethod
@@ -1343,6 +1621,7 @@ class TeamManager:
         single-session behavior because their bootstrap resources are scoped to
         one active session per channel.
         """
+        distributed = self._is_distributed_mode(get_config())
         normalized_previous = str(previous_session_id or "").strip()
         if normalized_previous and normalized_previous != target_session_id:
             # Product foreground/task facts own KVC offload.  A navigation
@@ -1351,9 +1630,10 @@ class TeamManager:
                 normalized_previous,
                 reason=f"{reason}session-switch: ",
                 offload=False,
+                preserve_organization=not distributed,
             )
 
-        if not self._is_distributed_mode(get_config()):
+        if not distributed:
             logger.info(
                 "[TeamManager] %sprepare_session_switch skipped for local runtime target=%s",
                 reason,
@@ -2157,12 +2437,13 @@ class TeamManager:
         session_id: str,
         channel_id: str | None = None,
     ) -> bool:
-        """Attach distributed bootstrap hooks to Runner-owned TeamAgent.
+        """Track Runner-owned TeamAgent, then attach hooks in distributed mode.
 
         When team streaming uses Runner.run_agent_team_streaming(), the actual
         TeamAgent is created and cached by openjiuwen TeamRuntimeManager pool,
         not by TeamManager.create_team(). This method retrieves the Runner-owned
-        TeamAgent from GLOBAL_RUNNER's pool and attaches distributed hooks.
+        TeamAgent from GLOBAL_RUNNER's pool for execution checks in every mode.
+        Distributed bootstrap hooks are attached only in distributed mode.
 
         Args:
             team_name: Team name to look up in Runner pool.
@@ -2172,21 +2453,11 @@ class TeamManager:
         Returns:
             True if hooks attached successfully, False otherwise.
         """
-        config_base = get_config()
-        if not self._is_distributed_mode(config_base):
-            logger.debug(
-                "[TeamManager] non-distributed mode; skip Runner runtime hooks "
-                "team_name=%s session_id=%s",
-                team_name,
-                session_id,
-            )
-            return False
-
         from openjiuwen.core.runner.runner import GLOBAL_RUNNER
 
         runtime_mgr = _runner_team_runtime_manager(GLOBAL_RUNNER)
         active_team = await runtime_mgr.pool.get(team_name)
-        if active_team is None:
+        if active_team is None or active_team.current_session_id != session_id:
             logger.warning(
                 "[TeamManager] Runner pool has no active team for distributed hooks "
                 "team_name=%s session_id=%s",
@@ -2206,6 +2477,9 @@ class TeamManager:
             return False
 
         self._runner_team_agents[session_id] = team_agent
+
+        if not self._is_distributed_mode(get_config()):
+            return False
 
         try:
             from jiuwenswarm.agents.harness.team.remote_member_bootstrap import (
@@ -2915,8 +3189,9 @@ class TeamManager:
         reason: str = "",
         *,
         offload: bool = True,
+        preserve_organization: bool = False,
     ) -> bool:
-        """Stop a parked Runner team runtime without touching active streams."""
+        """Stop a parked runtime; local navigation may preserve organization Teams."""
         async with self._get_lifecycle_lock(session_id):
             if self.has_stream_task(session_id):
                 logger.debug(
@@ -2932,6 +3207,25 @@ class TeamManager:
                     session_id,
                 )
                 return False
+
+            if preserve_organization:
+                from openjiuwen.core.runner.runner import GLOBAL_RUNNER
+
+                runtime_mgr = _runner_team_runtime_manager(GLOBAL_RUNNER)
+                entry = await runtime_mgr.pool.get(team_name)
+                if entry is not None and entry.current_session_id == session_id:
+                    backend = entry.agent.team_backend
+                    org_manager = getattr(backend, "org_task_manager", None)
+                    if getattr(org_manager, "organization_id", None):
+                        # A parked organization leader still receives task reviews
+                        # and final-report delivery while another session is visible.
+                        logger.info(
+                            "[TeamManager] preserve organization runtime during session switch: "
+                            "session_id=%s team_name=%s",
+                            session_id,
+                            team_name,
+                        )
+                        return False
 
             if offload:
                 await self._report_session_inactive(session_id)
@@ -3148,19 +3442,42 @@ _team_manager: TeamManager | None = None
 
 
 def is_team_session_running(session_id: str) -> bool:
-    """Inspect existing team state without creating or stopping a runtime.
+    """Read executing members and workflow agents, without counting ownership.
 
-    Only an admitted turn counts: an in-flight request still preparing, or an
-    active interaction round.  The persistent stream task and the pooled
-    runtime deliberately outlive the round, so keying on them kept a finished
-    Session "running" until the runtime was torn down.
+    Request, round, stream and runtime registrations may all survive execution.
+    They are not evidence that the Session is busy.
     """
     manager = _team_manager
     if manager is None:
         return False
-    return bool(
-        manager.has_inflight_request(session_id)
-        or manager.is_round_active(session_id)
+    team_agent = manager.get_team_agent(session_id)
+    if team_agent is not None:
+        # Cooperative pause waits for the executing tool to reach a boundary.
+        # PAUSING still executes; only the acknowledged PAUSED state is idle.
+        if team_agent.is_agent_running() or getattr(
+            getattr(team_agent, "harness", None), "state", None
+        ) is HarnessState.PAUSING:
+            return True
+        # The leader keeps the current member statuses from core transitions.
+        # Read peers only: its own harness above is the direct execution state.
+        registry = getattr(getattr(team_agent, "_state", None), "member_registry", None)
+        if registry is not None and any(
+            status == "busy" and name != registry.self_member_name
+            for name, status in registry.snapshot().items()
+        ):
+            return True
+    controller = manager.find_background_task_controller(session_id)
+    handler = manager.get_workflow_handler(session_id)
+    if controller is None or handler is None:
+        return False
+    # Paused/stopped runs leave resumable cards and monitor state behind.
+    # Only live runs with an agent actually running count; human waits do not.
+    active_runs = getattr(controller, "_active", {})
+    return any(
+        run_id in active_runs
+        and run.status == "running"
+        and any(agent.status == "running" for phase in run.phases for agent in phase.agents)
+        for run_id, run in handler.get_run_states().items()
     )
 
 
@@ -3188,6 +3505,45 @@ def team_session_has_parked_request(session_id: str, request_ids) -> bool:
     return all(
         manager.is_round_ended_request(session_id, request_id)
         for request_id in request_ids
+    )
+
+
+def team_round_finishing_after_flow(session_id: str) -> bool:
+    """Whether the active Team round is only wrapping up after its swarmflow runs ended.
+
+    Companion of :func:`is_team_session_running` for the lifecycle busy guard:
+    ``swarmflow.stop`` and natural workflow completion leave the round active
+    while the leader reports the outcome, so an archive or delete in that
+    window hits SESSION_BUSY even though nothing is left for the user to stop.
+    The guard uses this to answer "retry shortly" instead of "stop it first".
+
+    Two gates keep the probe honest: the round must itself have witnessed a
+    flow terminal event (``round_can_finish_after_flow`` — the workflow handler
+    keeps run states across rounds, so stale terminals from an earlier round
+    must not leak into a fresh one), and every run must be terminal.  A paused
+    run is deliberately excluded: the flow has not ended, so the user still
+    has something to resume or stop.
+    Outstanding Team tasks and execution after the terminal event also exclude
+    the round: flow completion alone does not mean the leader is only reporting.
+    """
+    manager = _team_manager
+    if manager is None or not manager.is_round_active(session_id):
+        return False
+    if not manager.round_can_finish_after_flow(session_id):
+        return False
+    handler = manager.get_workflow_handler(session_id)
+    if handler is None:
+        return False
+    get_run_states = getattr(handler, "get_run_states", None)
+    if not callable(get_run_states):
+        return False
+    run_states = get_run_states() or {}
+    if not run_states:
+        # A round that never ran a swarmflow is ordinary execution, not the
+        # post-flow report window this probe describes.
+        return False
+    return all(
+        bool(getattr(run, "is_terminal", False)) for run in run_states.values()
     )
 
 

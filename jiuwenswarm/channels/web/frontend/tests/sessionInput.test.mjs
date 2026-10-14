@@ -9,7 +9,7 @@ import { JSDOM, VirtualConsole } from 'jsdom';
 import { A2UIProvider } from '@a2ui/react';
 
 const frontendRoot = fileURLToPath(new URL('..', import.meta.url));
-let useWebSocket, useChatStore, useSessionStore, useGoalStore, webClient, TaskQueue, ChatTimelineList;
+let useWebSocket, useChatStore, useSessionStore, useGoalStore, webClient, TaskQueue, ChatTimelineList, buildTimelineItems;
 
 before(async () => {
   const outdir = join(frontendRoot, 'node_modules/.cache/session-input');
@@ -20,6 +20,7 @@ before(async () => {
       sessionStore: 'src/stores/sessionStore.ts',
       goalStore: 'src/stores/goalStore.ts',
       webClient: 'src/services/webClient.ts',
+      timeline: 'src/features/chatTimeline/buildTurnTimeline.ts',
       TaskQueue: 'queue-component',
     },
     absWorkingDir: frontendRoot,
@@ -59,6 +60,7 @@ before(async () => {
   ({ useSessionStore } = await load('sessionStore'));
   ({ useGoalStore } = await load('goalStore'));
   ({ webClient } = await load('webClient'));
+  ({ buildTimelineItems } = await load('timeline'));
   ({ TaskQueue, ChatTimelineList } = await load('TaskQueue'));
 });
 
@@ -130,6 +132,8 @@ async function mount(context) {
       createElement(TaskQueue, {
         isProcessing: true,
         onSendTask: (text, media, options) => api.sendMessage(text, sid, media, options),
+        onContinueQueuedSessionMessages: (targetSessionId) =>
+          api.request('session.message.continue_queued', { session_id: targetSessionId }),
         onDrainTaskQueueIfIdle: api.drainTaskQueueIfIdle,
       }),
       createElement(A2UIProvider, null,
@@ -202,6 +206,238 @@ function assertNodeBefore(earlier, later, message) {
   const following = earlier.ownerDocument.defaultView.Node.DOCUMENT_POSITION_FOLLOWING;
   assert.ok(relation & following, message);
 }
+
+async function sendNormalMessage(c) {
+  let sending;
+  await act(async () => {
+    sending = c.api().sendMessage('new timestamped input', c.sid);
+  });
+  const request = c.requests().at(-1);
+  assert.ok(request);
+  await act(async () => {
+    c.socket.response(request.id);
+    assert.equal(await sending, true);
+  });
+  const user = c.runtime().messages.find((message) => message.content === 'new timestamped input');
+  assert.ok(user);
+  return { requestId: request.id, messageId: user.id };
+}
+
+for (const timestamp of [undefined, 'invalid', 0]) {
+  test(`an invalid ACK timestamp (${timestamp}) retains the output-phase fallback`, async (context) => {
+    const c = await mount(context);
+    try {
+      const sent = await sendNormalMessage(c);
+      const serverTimestamp = Date.now() - 60_000;
+      c.receive('runtime.accepted', { request_id: sent.requestId, timestamp });
+      c.receive('chat.output_phase', {
+        request_id: sent.requestId,
+        output_phase_id: 'timestamp-phase',
+        timestamp: serverTimestamp,
+      });
+      assert.equal(
+        c.runtime().messages.find((m) => m.id === sent.messageId).timestamp,
+        new Date(serverTimestamp).toISOString(),
+      );
+    } finally {
+      await c.dispose();
+    }
+  });
+}
+
+test('output-phase fallback uses the input time without changing model output timestamps', async (context) => {
+  const c = await mount(context);
+  try {
+    const sent = await sendNormalMessage(c);
+    const inputTimestamp = Date.now() - 60_000;
+    const outputTimestamp = inputTimestamp + 10_000;
+    c.receive('chat.output_phase', {
+      request_id: sent.requestId,
+      output_phase_id: 'timestamp-phase',
+      input_timestamp: inputTimestamp,
+      timestamp: outputTimestamp,
+      output_order: { request_id: sent.requestId, sequence: 1 },
+    });
+    c.receive('chat.reasoning', {
+      request_id: sent.requestId,
+      output_phase_id: 'timestamp-phase',
+      timestamp: outputTimestamp,
+      content: 'new timestamped reasoning',
+      output_order: { request_id: sent.requestId, sequence: 2 },
+    });
+    assert.equal(
+      c.runtime().messages.find((m) => m.id === sent.messageId).timestamp,
+      new Date(inputTimestamp).toISOString(),
+    );
+    assert.equal(c.runtime().reasoningSegments.at(-1).startedAt, outputTimestamp);
+  } finally {
+    await c.dispose();
+  }
+});
+
+for (const event of ['runtime.accepted', 'chat.output_phase']) {
+  for (const clockOffset of [-60_000, 0, 60_000]) {
+    test(`legacy image notice stays in its user turn after ${event}, clock offset ${clockOffset}`, async (context) => {
+      const c = await mount(context);
+      try {
+        addOriginalUser(c);
+        const sent = await sendNormalMessage(c);
+        await c.tick(20);
+        c.receive('chat.notice', {
+          request_id: sent.requestId,
+          notice_type: 'image_tool_fallback',
+          content: 'Image is not supported',
+        });
+        c.receive('chat.notice', {
+          request_id: 'unrelated',
+          notice_type: 'image_tool_fallback',
+          content: 'Unrelated notice',
+        });
+        const unrelatedTimestamp = c
+          .runtime()
+          .messages.find((m) => m.id === 'notice-image_tool_fallback-unrelated').timestamp;
+        await c.tick(20);
+        c.receive(event, {
+          request_id: sent.requestId,
+          timestamp: Date.now() + clockOffset,
+          output_phase_id: 'timestamp-phase',
+        });
+        const items = buildTimelineItems(c.runtime().messages, [], []);
+        const userIndex = items.findIndex((item) => item.message?.id === sent.messageId);
+        const noticeIndex = items.findIndex(
+          (item) => item.message?.id === `notice-image_tool_fallback-${sent.requestId}`,
+        );
+        assert.ok(userIndex < noticeIndex, `notice index ${noticeIndex}, user index ${userIndex}`);
+        assert.equal(
+          c.runtime().messages.find((m) => m.id === 'notice-image_tool_fallback-unrelated').timestamp,
+          unrelatedTimestamp,
+        );
+      } finally {
+        await c.dispose();
+      }
+    });
+  }
+}
+
+test('image notice retains its server time after backfilling the earlier input boundary', async (context) => {
+  const c = await mount(context);
+  try {
+    const sent = await sendNormalMessage(c);
+    const inputTimestamp = Date.now() - 60_000;
+    const noticeTimestamp = inputTimestamp + 20;
+    c.receive('chat.notice', {
+      request_id: sent.requestId,
+      notice_type: 'image_tool_fallback',
+      content: 'Image is not supported',
+      timestamp: noticeTimestamp,
+    });
+    c.receive('runtime.accepted', { request_id: sent.requestId, timestamp: inputTimestamp });
+    assert.equal(
+      c.runtime().messages.find((m) => m.id === sent.messageId).timestamp,
+      new Date(inputTimestamp).toISOString(),
+    );
+    assert.equal(
+      c.runtime().messages.find((m) => m.id === `notice-image_tool_fallback-${sent.requestId}`).timestamp,
+      new Date(noticeTimestamp).toISOString(),
+    );
+    // A later phase may not move the user bubble from its acknowledged input boundary.
+    c.receive('chat.output_phase', {
+      request_id: sent.requestId,
+      output_phase_id: 'timestamp-phase',
+      timestamp: inputTimestamp + 10_000,
+    });
+    assert.equal(
+      c.runtime().messages.find((m) => m.id === sent.messageId).timestamp,
+      new Date(inputTimestamp).toISOString(),
+    );
+  } finally {
+    await c.dispose();
+  }
+});
+
+test('queued cross-session message appears in the target queue until it starts', async (context) => {
+  const c = await mount(context);
+  try {
+    const streamId = c.runtime().currentStreamId;
+    const message = {
+      message_id: 'sm-1',
+      source_session_id: 'source-1',
+      source_title: 'Source',
+      target_session_id: c.sid,
+      content: 'Check the weather',
+      status: 'queued',
+    };
+    c.receive('session.message.updated', { message });
+    const row = document.querySelector('[data-testid="chat-panel-cross-session-queue-item"]');
+    assert.ok(row);
+    assert.match(row.textContent, /Check the weather/);
+    assert.match(row.textContent, /Source/);
+    assert.equal(row.querySelector('button'), null);
+    const resume = document.querySelector('[data-testid="chat-panel-cross-session-queue-resume"]');
+    assert.ok(resume);
+    await act(async () => resume.click());
+    const continuation = c.socket.requests.find((request) => request.method === 'session.message.continue_queued');
+    assert.ok(continuation);
+    assert.equal(continuation.params.session_id, c.sid);
+    await act(async () => c.socket.response(continuation.id));
+    assert.equal(c.runtime().currentStreamId, streamId);
+    assert.equal(c.runtime().isProcessing, true);
+
+    c.receive('session.message.updated', { message: { ...message, status: 'running' } });
+    assert.equal(document.querySelector('[data-testid="chat-panel-cross-session-queue-item"]'), null);
+  } finally {
+    await c.dispose();
+  }
+});
+
+test('cross-session final replaces later output from the same request', async (context) => {
+  const c = await mount(context);
+  try {
+    const route = {
+      request_id: 'cross-session-turn',
+      turn_request_id: 'cross-session-turn',
+      message_origin: 'cross_session_agent',
+      session_message_id: 'sm-1',
+      cross_session: {
+        message_id: 'sm-1',
+        source_session_id: 'source-1',
+        content: 'Check the weather',
+      },
+    };
+    c.receive('chat.delta', { ...route, content: '杭州今日天气' });
+    c.receive('chat.final', { ...route, content: '杭州今日天气' });
+    c.receive('chat.delta', { ...route, content: '杭州今日天气' });
+    c.receive('chat.final', { ...route, content: '杭州今日天气' });
+
+    const reply = c.runtime().messages.find((message) => message.id === 'cross-session-assistant-cross-session-turn');
+    assert.equal(reply?.content, '杭州今日天气');
+    assert.equal(reply?.isStreaming, false);
+  } finally {
+    await c.dispose();
+  }
+});
+
+test('mixed queues show pause only on the local section', async (context) => {
+  const c = await mount(context);
+  try {
+    c.queue('local task');
+    act(() => useChatStore.getState().setQueuePaused(c.sid, true));
+    c.receive('session.message.updated', { message: {
+      message_id: 'sm-mixed',
+      source_session_id: 'source-1',
+      source_title: 'Source',
+      target_session_id: c.sid,
+      content: 'remote task',
+      status: 'queued',
+    } });
+    assert.equal(document.querySelector('[data-testid="chat-panel-task-queue-header"] [data-testid="chat-panel-task-queue-paused-badge"]'), null);
+    assert.ok(document.querySelector('[data-testid="chat-panel-cross-session-queue-section"]'));
+    assert.ok(document.querySelector('[data-testid="chat-panel-task-queue-local-section"] [data-testid="chat-panel-task-queue-paused-badge"]'));
+    assert.ok(document.querySelector('[data-testid="chat-panel-task-queue-local-section"] [data-testid="chat-panel-task-queue-resume"]'));
+  } finally {
+    await c.dispose();
+  }
+});
 
 test('two queued messages: only the selected item steers, locks double click, and waits for Runtime ACK', async (context) => {
   const c = await mount(context);
@@ -1013,6 +1249,31 @@ test('editing, deleting and clearing queued messages preserve sending and unknow
     assert.equal(c.runtime().taskQueue.length, 0);
     c.receive('runtime.accepted', { request_id: c.requests()[0].id });
     assert.equal(c.receipt(sending).status, 'accepted');
+  } finally {
+    await c.dispose();
+  }
+});
+
+test('cross-session steering keeps its Agent source and the original task running', async (context) => {
+  const c = await mount(context);
+  try {
+    addOriginalUser(c);
+    const received = {
+      request_id: 'original', input_request_id: 'cross-steer', content: 'Agent adjustment',
+      timestamp: Date.now(), message_origin: 'cross_session_agent', session_message_id: 'sm-cross',
+      cross_session: { message_id: 'sm-cross', source_session_id: 'source-agent', source_title: 'Source Agent', content: 'Agent adjustment' },
+    };
+    c.receive('chat.input_received', received);
+    c.receive('chat.input_received', received);
+    await c.flush();
+    const inputs = c.runtime().messages.filter(m => m.supplementalInput?.requestId === 'cross-steer');
+    assert.equal(inputs.length, 1);
+    assert.deepEqual(inputs[0].crossSession, {
+      messageId: 'sm-cross', sourceSessionId: 'source-agent', sourceTitle: 'Source Agent', content: 'Agent adjustment',
+    });
+    assert.equal(c.runtime().isProcessing, true);
+    assert.equal(c.requests().length, 0);
+    assert.match(document.body.textContent, /Source Agent/);
   } finally {
     await c.dispose();
   }

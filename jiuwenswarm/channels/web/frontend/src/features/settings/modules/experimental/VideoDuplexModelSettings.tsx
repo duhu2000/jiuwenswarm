@@ -1,14 +1,15 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { settingsActionIcons } from '../../../../assets/settings';
-import { Button } from '../../../../components/ui';
+import { Button, Select } from '../../../../components/ui';
 import { FormDialog } from '../../../../components/form';
-import { SettingsConfirmDialog } from '../../components';
+import { SettingRow, SettingsConfirmDialog } from '../../components';
 import { webRequest } from '../../../../services/webClient';
 import './VideoDuplexModelSettings.css';
 
 type Provider = 'joyai' | 'qwen_omni';
 type VoiceProtocol = 'native_ws' | 'openai_http';
+type ReplyLanguage = 'match' | 'zh-CN' | 'en';
 
 type SettingsValues = {
   video_live_provider: Provider;
@@ -19,6 +20,7 @@ type SettingsValues = {
   qwen_omni_api_key: string;
   qwen_omni_model: string;
   qwen_omni_voice: string;
+  reply_language: ReplyLanguage;
   voice_protocol: VoiceProtocol;
   voice_asr_endpoint: string;
   voice_tts_endpoint: string;
@@ -29,21 +31,22 @@ type SettingsValues = {
 };
 
 const DEFAULTS: SettingsValues = {
-  video_live_provider: 'joyai',
+  video_live_provider: 'qwen_omni',
   joyai_api_base: '',
   joyai_api_key: '',
-  joyai_model: 'jdopensource/JoyAI-VL-Interaction',
+  joyai_model: '',
   qwen_omni_realtime_url: '',
   qwen_omni_api_key: '',
-  qwen_omni_model: 'qwen3.5-omni-flash-realtime',
-  qwen_omni_voice: 'Cherry',
-  voice_protocol: 'native_ws',
-  voice_asr_endpoint: 'ws://127.0.0.1:8994/ws/asr',
-  voice_tts_endpoint: 'ws://127.0.0.1:8992/ws/tts',
+  qwen_omni_model: '',
+  qwen_omni_voice: '',
+  reply_language: 'match',
+  voice_protocol: 'openai_http',
+  voice_asr_endpoint: '',
+  voice_tts_endpoint: '',
   voice_api_key: '',
   voice_asr_model: '',
   voice_tts_model: '',
-  voice_tts_voice: 'vivian',
+  voice_tts_voice: '',
 };
 
 const SECRET_KEYS = ['joyai_api_key', 'qwen_omni_api_key', 'voice_api_key'] as const;
@@ -165,7 +168,9 @@ export function VideoDuplexModelSettings() {
     setDeleteError('');
     try {
       const emptyValues = Object.fromEntries(Object.keys(DEFAULTS).map((key) => [key, ''])) as Record<string, string>;
-      emptyValues.video_live_provider = 'joyai';
+      emptyValues.video_live_provider = DEFAULTS.video_live_provider;
+      emptyValues.reply_language = DEFAULTS.reply_language;
+      emptyValues.voice_protocol = DEFAULTS.voice_protocol;
       const payload = await webRequest<Payload>(
         'video.duplex.settings.update',
         { values: emptyValues, clear_secrets: true },
@@ -179,6 +184,48 @@ export function VideoDuplexModelSettings() {
       setDeleting(false);
     }
   };
+
+  const saveReplyLanguage = async (replyLanguage: ReplyLanguage) => {
+    if (replyLanguage === values.reply_language || saving || deleting) return;
+    setSaving(true);
+    setError('');
+    try {
+      const payload = await webRequest<Payload>(
+        'video.duplex.settings.update',
+        { values: { reply_language: replyLanguage } },
+        { timeoutMs: 10_000 },
+      );
+      applyPayload(payload);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : t('settingsPanel.videoDuplex.saveError'));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const replyLanguageSelect = (
+    value: ReplyLanguage,
+    onChange: (value: ReplyLanguage) => void,
+    options: { disabled?: boolean; testId?: string } = {},
+  ) => (
+    <SettingRow
+      title={t('settingsPanel.videoDuplex.replyLanguageLabel')}
+      description={t('settingsPanel.videoDuplex.replyLanguageDescription')}
+    >
+      <Select
+        value={value}
+        disabled={options.disabled}
+        onChange={(next) => onChange(next as ReplyLanguage)}
+        data-testid={options.testId || 'settings-video-duplex-reply-language'}
+        aria-label={t('settingsPanel.videoDuplex.replyLanguageLabel')}
+        options={[
+          { value: 'match', label: t('settingsPanel.videoDuplex.replyLanguageMatch') },
+          { value: 'zh-CN', label: t('settingsPanel.videoDuplex.replyLanguageZhCN') },
+          { value: 'en', label: t('settingsPanel.videoDuplex.replyLanguageEn') },
+        ]}
+      />
+    </SettingRow>
+  );
 
   if (loading) {
     return <div className="video-duplex-model-settings__status">{t('settingsPanel.videoDuplex.loading')}</div>;
@@ -228,6 +275,12 @@ export function VideoDuplexModelSettings() {
         </div>
       )}
 
+      <div className="video-duplex-model-settings__reply-language">
+        {replyLanguageSelect(values.reply_language, (value) => void saveReplyLanguage(value), {
+          disabled: saving || deleting,
+        })}
+      </div>
+
       {draft ? (
         <FormDialog
           open
@@ -243,6 +296,9 @@ export function VideoDuplexModelSettings() {
           }}
         >
           <div className="video-duplex-model-settings__dialog-fields">
+            {replyLanguageSelect(draft.reply_language, (value) => updateDraft('reply_language', value), {
+              testId: 'settings-video-duplex-reply-language-draft',
+            })}
             <label className="video-duplex-model-settings__field">
               <span>{t('settingsPanel.videoDuplex.providerLabel')}</span>
               <select
@@ -255,7 +311,7 @@ export function VideoDuplexModelSettings() {
             </label>
             {draft.video_live_provider === 'joyai' ? (
               <>
-                <ConfigField value={draft.joyai_api_base} label="JoyAI API Base" placeholder="http://127.0.0.1:8070/v1" onChange={(value) => updateDraft('joyai_api_base', value)} />
+                <ConfigField value={draft.joyai_api_base} label="JoyAI API Base" onChange={(value) => updateDraft('joyai_api_base', value)} />
                 <ConfigField value={draft.joyai_api_key} label="JoyAI API Key" secret placeholder={secretPlaceholder(secretLengths.joyai_api_key)} onChange={(value) => updateDraft('joyai_api_key', value)} />
                 <ConfigField value={draft.joyai_model} label={t('settingsPanel.videoDuplex.joyaiModelLabel')} onChange={(value) => updateDraft('joyai_model', value)} />
                 <h3>{t('settingsPanel.videoDuplex.voiceSectionTitle')}</h3>

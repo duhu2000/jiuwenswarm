@@ -28,6 +28,7 @@ from jiuwenswarm.common.kv_cache_affinity_config import (
     validate_affinity_invariant,
 )
 from jiuwenswarm.common.security.base_crypto import get_crypto_provider
+from jiuwenswarm.common.runtime_model_config import apply_runtime_model_config
 from jiuwenswarm.common.utils import (
     get_config_dir,
     get_config_file,
@@ -39,7 +40,13 @@ _CONFIG_MODULE_DIR = Path(__file__).parent
 CONFIG_YAML_PATH = get_config_file()
 SWARMFLOW_ENABLED_CONFIG_PATH = ("modes", "team", "jiuwen_team", "enable_swarmflow")
 SWARMFLOW_BUDGET_CONFIG_PATH = ("modes", "team", "jiuwen_team", "swarmflow_budget")
+SWARMFLOW_WORKTREE_CONFIG_PATH = ("modes", "team", "jiuwen_team", "worktree", "enabled")
+DEFAULT_SWARMFLOW_WORKTREE_ENABLED = False
 DEFAULT_SWARMFLOW_ENABLED = False
+TEAM_DISPATCH_MODE_CONFIG_PATH = ("modes", "team", "jiuwen_team", "dispatch_mode")
+TEAM_TASK_VERIFICATION_CONFIG_PATH = ("modes", "team", "jiuwen_team", "enable_task_verification")
+DEFAULT_TEAM_DISPATCH_MODE = "autonomous"
+DEFAULT_TEAM_TASK_VERIFICATION_ENABLED = False
 EXTERNAL_CLI_PUBLISH_URL_FRONT_KEY = "external_cli_publish_url"
 EXTERNAL_CLI_AGENTS_CONFIG_PATH = ("modes", "team", "jiuwen_team", "external_cli_agents")
 EXTERNAL_TRANSPORT_CONFIG_PATH = ("modes", "team", "jiuwen_team", "external_transport")
@@ -241,7 +248,21 @@ def get_config():
     config_base = resolve_env_vars(config_base)
     _normalize_config(config_base)
 
-    return config_base
+    from jiuwenswarm.common.agentos_runtime import is_agentos_runtime
+    if is_agentos_runtime():
+        for section, env_key in (
+            ("code_graph", "JIUWENSWARM_AGENTOS_CODE_GRAPH_CONFIG"),
+            ("sandbox", "JIUWENSWARM_AGENTOS_SANDBOX_CONFIG"),
+        ):
+            try:
+                defaults = json.loads(os.getenv(env_key, "{}"))
+                if isinstance(defaults, dict) and defaults:
+                    local = config_base.get(section)
+                    config_base[section] = {**defaults, **local} if isinstance(local, dict) else defaults
+            except (ValueError, TypeError):
+                logger.warning("Ignoring malformed AgentOS %s deployment config", section)
+
+    return apply_runtime_model_config(config_base)
 
 
 def get_configured_read_image_multimodal(
@@ -303,18 +324,28 @@ def get_skill_evolution_enabled(config: dict[str, Any] | None) -> bool:
 
 def get_symphony_evolution_enabled(config: dict[str, Any] | None) -> bool:
     """Return whether both Symphony and its evolution switch are enabled."""
+
+    from jiuwenswarm.symphony.config import (
+        resolve_symphony_enabled,
+        resolve_symphony_evolution_enabled,
+    )
+
     if not isinstance(config, dict):
         return False
     symphony = config.get("symphony")
     if not isinstance(symphony, dict):
-        return False
+        symphony = {}
     evolution = symphony.get("evolution")
     if not isinstance(evolution, dict):
-        return False
-    enabled_values = {"1", "true", "yes", "on"}
+        evolution = {}
+    # enabled 位于 evolution.flow 下；旧配置（evolution.enabled）向后兼容
+    flow = evolution.get("flow")
+    flow_enabled = flow.get("enabled") if isinstance(flow, dict) else None
+    if flow_enabled is None:
+        flow_enabled = evolution.get("enabled")
     return (
-        str(symphony.get("enabled")).strip().lower() in enabled_values
-        and str(evolution.get("enabled")).strip().lower() in enabled_values
+        resolve_symphony_enabled(symphony.get("enabled"))
+        and resolve_symphony_evolution_enabled(flow_enabled)
     )
 
 
@@ -402,6 +433,18 @@ def get_progressive_tool_enabled(config: dict[str, Any] | None = None) -> bool:
     return bool(value)
 
 
+def is_tool_retrieval_enabled(config: dict[str, Any] | None = None) -> bool:
+    """Return whether the ``tool_search`` progressive disclosure is enabled.
+
+    Reuses the single top-level ``progressive_tool_enabled`` switch (the same
+    one historically documented for the deferred-tool pipeline). ``true`` means
+    our skill_index-framework ``tool_search`` is mounted and deferred tools are
+    hidden until discovered; ``false`` disables it and every tool stays direct.
+    """
+
+    return False
+
+
 def get_endpoint_profile_overrides(config: dict[str, Any] | None = None) -> dict[str, str]:
     """Return the user-configured ``api_base host -> endpoint_profile`` map.
 
@@ -452,6 +495,24 @@ def update_skill_evolution_enabled_in_config(enabled: bool) -> None:
             evolution = {}
             react["evolution"] = evolution
         evolution["skill_evolution"] = bool(enabled)
+        return data
+
+    update_config(mutator)
+
+
+def update_ttse_enabled_in_config(enabled: bool) -> None:
+    """Atomically update the canonical ``react.ttse.enabled`` switch."""
+
+    def mutator(data: dict[str, Any]) -> dict[str, Any]:
+        react = data.get("react")
+        if not isinstance(react, dict):
+            react = {}
+            data["react"] = react
+        ttse = react.get("ttse")
+        if not isinstance(ttse, dict):
+            ttse = {}
+            react["ttse"] = ttse
+        ttse["enabled"] = bool(enabled)
         return data
 
     update_config(mutator)
@@ -806,6 +867,18 @@ def update_browser_in_config(updates: dict[str, Any]) -> None:
     dump_yaml_round_trip(CONFIG_YAML_PATH, data)
 
 
+def update_browser_decision_in_config(updates: dict[str, Any]) -> None:
+    """只更新 browser.decision 中给定的字段，保留阈值等其余字段。"""
+    data = load_yaml_round_trip(CONFIG_YAML_PATH)
+    if not isinstance(data.get("browser"), dict):
+        data["browser"] = {}
+    if not isinstance(data["browser"].get("decision"), dict):
+        data["browser"]["decision"] = {}
+    for key, value in updates.items():
+        data["browser"]["decision"][key] = value
+    dump_yaml_round_trip(CONFIG_YAML_PATH, data)
+
+
 def update_context_engine_enabled_in_config(value: bool) -> None:
     """更新 react.context_engine_config.enabled（上下文压缩开关）并写回。"""
     data = load_yaml_round_trip(CONFIG_YAML_PATH)
@@ -879,6 +952,7 @@ def update_permissions_profile_in_config(profile: str) -> None:
     """Atomically persist the Web permission profile to runtime fields."""
     runtime_values = {
         "default": (True, "manual"),
+        "automatic": (True, "auto"),
         "full_access": (False, "manual"),
     }
     try:
@@ -896,6 +970,15 @@ def update_permissions_profile_in_config(profile: str) -> None:
         return data
 
     update_config(_mutate)
+
+
+def update_a4p_in_config(updates: dict[str, Any]) -> None:
+    """更新 a4p 配置段并写回。"""
+    data = load_yaml_round_trip(CONFIG_YAML_PATH)
+    if "a4p" not in data or data["a4p"] is None:
+        data["a4p"] = {}
+    _merge_config_dict(data["a4p"], updates)
+    dump_yaml_round_trip(CONFIG_YAML_PATH, data)
 
 
 def update_auto_recap_enabled_in_config(value: bool) -> None:
@@ -962,6 +1045,15 @@ def update_trajectory_ui_in_config(enabled: bool) -> None:
     if "trajectory_ui" not in data or data["trajectory_ui"] is None:
         data["trajectory_ui"] = {}
     data["trajectory_ui"]["enabled"] = bool(enabled)
+    dump_yaml_round_trip(CONFIG_YAML_PATH, data)
+
+
+def update_team_organization_ui_in_config(enabled: bool) -> None:
+    """Persist the experimental Organization UI switch without changing runtime capabilities."""
+    data = load_yaml_round_trip(CONFIG_YAML_PATH)
+    if "experimental" not in data or data["experimental"] is None:
+        data["experimental"] = {}
+    data["experimental"]["team_organization_ui_enabled"] = bool(enabled)
     dump_yaml_round_trip(CONFIG_YAML_PATH, data)
 
 
@@ -1400,6 +1492,9 @@ def _infer_is_default(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     groups: OrderedDict[str, list[int]] = OrderedDict()
     for i, entry in enumerate(result):
+        if not isinstance(entry, dict):
+            # 非 dict 的脏条目不参与分组，但保留原位置以维持下标稳定
+            continue
         name = (entry.get("model_client_config") or {}).get("model_name", "")
         if name not in groups:
             groups[name] = []
@@ -1448,6 +1543,12 @@ def _decrypt_model_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]
         )
 
     for entry in result:
+        if not isinstance(entry, dict):
+            continue
+        # YAML 里 `model_config_obj:` 后只跟注释时解析为 null（键存在，
+        # dict.get 的默认值不生效），统一回填为空 dict，下游 .get 不再崩。
+        if entry.get("model_config_obj") is None:
+            entry["model_config_obj"] = {}
         mcc = entry.get("model_client_config")
         if isinstance(mcc, dict):
             if mcc.get("api_key") and crypto:
@@ -1510,6 +1611,294 @@ def get_agentos_models(config: dict[str, Any] | None = None) -> list[dict[str, A
             agentos_mco["_source"] = "agentos"
         entries.append(agentos_entry)
     return entries
+
+
+def _new_business_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def _ensure_model_business_ids(models: dict[str, Any]) -> bool:
+    """Add missing stable IDs in-place. Return whether anything changed."""
+    changed = False
+    for source in ("defaults", "agentos"):
+        entries = models.get(source)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if isinstance(entry, dict) and not str(entry.get("model_id") or "").strip():
+                entry["model_id"] = _new_business_id("mdl")
+                changed = True
+    groups = models.get("groups")
+    if isinstance(groups, list):
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            if not str(group.get("model_group_id") or "").strip():
+                group["model_group_id"] = _new_business_id("mgp")
+                changed = True
+            routes = group.get("routes")
+            if isinstance(routes, list):
+                for route in routes:
+                    if isinstance(route, dict) and not str(route.get("route_id") or "").strip():
+                        route["route_id"] = _new_business_id("rte")
+                        changed = True
+    return changed
+
+
+def migrate_model_business_ids() -> bool:
+    """Idempotently add IDs and atomically persist only a valid candidate config."""
+    changed = False
+
+    def _mutate(data: dict[str, Any]) -> dict[str, Any] | None:
+        nonlocal changed
+        models = data.setdefault("models", {})
+        if not isinstance(models, dict):
+            raise ValueError("models must be an object")
+        changed = _ensure_model_business_ids(models)
+        from jiuwenswarm.common.model_config_validation import raise_if_invalid
+        raise_if_invalid(models)
+        return data if changed else None
+
+    update_config(_mutate)
+    return changed
+
+
+def load_models_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return an ID-indexed, decrypted snapshot without mutating persisted config."""
+    config = deepcopy(config if config is not None else get_config())
+    models = config.get("models") or {}
+    defaults = _decrypt_model_entries(models.get("defaults") or [])
+    agentos = get_agentos_models(config)
+    groups = deepcopy(models.get("groups") or [])
+    by_id: dict[str, dict[str, Any]] = {}
+    for source, entries in (("defaults", defaults), ("agentos", agentos)):
+        for entry in entries:
+            entry["model_detail"] = {
+                **(entry.get("model_detail") or {}),
+                "fallback_tag": (entry.get("model_client_config") or {}).get("model_name"),
+            }
+            model_id = str(entry.get("model_id") or "").strip()
+            if model_id:
+                by_id[model_id] = {"source": source, "entry": entry}
+    return {"defaults": defaults, "agentos": agentos, "groups": groups, "by_id": by_id}
+
+
+def save_models_candidate(models: dict[str, Any]) -> dict[str, Any]:
+    """Validate and atomically replace only the models section."""
+    candidate = deepcopy(models)
+    _ensure_model_business_ids(candidate)
+    from jiuwenswarm.common.model_config_validation import raise_if_invalid
+    raise_if_invalid(candidate)
+
+    def _mutate(data: dict[str, Any]) -> dict[str, Any]:
+        data["models"] = candidate
+        return data
+
+    update_config(_mutate)
+    return candidate
+
+
+def _normalize_model_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """Convert a flat frontend-style model entry into the nested config format.
+
+    If the entry already has a ``model_client_config`` dict, assume it is already
+    normalized and return as-is.  Otherwise promote flat fields into the nested
+    structure the rest of the system expects.
+    """
+    saved = deepcopy(entry)
+    if isinstance(saved.get("model_client_config"), dict):
+        return saved
+    mcc: dict[str, Any] = {}
+    mco: dict[str, Any] = {}
+    if "model_name" in saved:
+        mcc["model_name"] = str(saved.pop("model_name") or "")
+    if "api_base" in saved:
+        mcc["api_base"] = str(saved.pop("api_base") or "")
+    if "api_key" in saved:
+        mcc["api_key"] = saved.pop("api_key") or ""
+    provider = str(saved.pop("model_provider", saved.pop("client_provider", "")) or "")
+    if provider:
+        mcc["client_provider"] = provider
+    if "timeout" in saved:
+        mcc["timeout"] = saved.pop("timeout")
+    if "verify_ssl" in saved:
+        mcc["verify_ssl"] = bool(saved.pop("verify_ssl"))
+    if "endpoint_profile" in saved:
+        val = saved.pop("endpoint_profile")
+        if val:
+            mcc["endpoint_profile"] = str(val)
+    if "vendor_key" in saved:
+        val = saved.pop("vendor_key")
+        if val:
+            mcc["vendor_key"] = str(val)
+    if "plan" in saved:
+        val = saved.pop("plan")
+        if val:
+            mcc["plan"] = str(val)
+    temp = saved.pop("temperature", None)
+    if temp is not None:
+        mco["temperature"] = float(temp)
+    rl = saved.pop("reasoning_level", None)
+    if rl is not None and str(rl).strip():
+        mco["reasoning_level"] = str(rl).strip()
+    if mcc:
+        saved["model_client_config"] = mcc
+    if mco:
+        saved["model_config_obj"] = mco
+    return saved
+
+
+def _merge_model_update(current: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
+    """Merge an editable DTO while preserving omitted/write-only settings."""
+    merged = deepcopy(current)
+    for key, value in update.items():
+        if key in {"source", "is_agentos", "read_only", "write_only_fields"}:
+            continue
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_model_update(merged[key], value)
+        else:
+            merged[key] = deepcopy(value)
+    return merged
+
+
+def upsert_model_resource(entry: dict[str, Any]) -> dict[str, Any]:
+    saved = _normalize_model_entry(entry)
+    saved.setdefault("model_id", _new_business_id("mdl"))
+
+    def _mutate(data):
+        nonlocal saved
+        candidate = data.setdefault("models", {})
+        _require_editable_model(candidate, saved["model_id"])
+        defaults = candidate.setdefault("defaults", [])
+        for index, current in enumerate(defaults):
+            if current.get("model_id") == saved["model_id"]:
+                _protect_model_key(saved, current)
+                saved = _merge_model_update(current, saved)
+                defaults[index] = saved
+                break
+        else:
+            _protect_model_key(saved, {})
+            defaults.append(saved)
+        if entry.get("is_default") is True:
+            for current in defaults:
+                current["is_default"] = current["model_id"] == saved["model_id"]
+        _validate_model_candidate(candidate)
+        return data
+
+    update_config(_mutate)
+    return saved
+
+
+def _require_editable_model(models: dict[str, Any], model_id: str) -> None:
+    from jiuwenswarm.common.model_errors import MODEL_SELECTION_FORBIDDEN, ModelSelectionError
+
+    if any(entry.get("model_id") == model_id for entry in models.get("agentos") or []):
+        raise ModelSelectionError(MODEL_SELECTION_FORBIDDEN, "AgentOS models are read-only")
+
+
+def _protect_model_key(update: dict[str, Any], current: dict[str, Any]) -> None:
+    """Preserve omitted credentials; encrypt changed keys with the installed provider."""
+    client = update.get("model_client_config") or {}
+    if "api_key" not in client:
+        return
+    key = client["api_key"]
+    previous = (current.get("model_client_config") or {}).get("api_key")
+    if key == previous or not key:
+        return
+    crypto = get_crypto_provider()
+    if crypto is not None:
+        resolved = _decrypt_model_entries([current])[0]
+        previous_plaintext = (resolved.get("model_client_config") or {}).get("api_key")
+        if previous and key == previous_plaintext:
+            client["api_key"] = previous
+        else:
+            client["api_key"] = crypto.encrypt(key)
+
+
+def _validate_model_candidate(candidate: dict[str, Any]) -> None:
+    from jiuwenswarm.common.model_config_validation import raise_if_invalid
+
+    _ensure_model_business_ids(candidate)
+    raise_if_invalid(candidate)
+
+
+def _require_unreferenced_model(
+    data: dict[str, Any], resource_type: str, resource_id: str, *, cron_references_checked: bool = False,
+) -> None:
+    from jiuwenswarm.common.model_catalog import ModelCatalog
+    from jiuwenswarm.common.model_errors import MODEL_SELECTION_REFERENCED, ModelSelectionError
+    from jiuwenswarm.common.model_selection import ModelSelection
+    from jiuwenswarm.runtime.cron.factory import load_cron_store_settings
+
+    is_etcd = load_cron_store_settings(data).backend == "etcd"
+    if is_etcd and not cron_references_checked:
+        raise ModelSelectionError(
+            MODEL_SELECTION_REFERENCED, "use the resource API to check etcd references before deletion",
+        )
+    refs = ModelCatalog(data).find_references(
+        ModelSelection(type=resource_type, id=resource_id), include_cron=not is_etcd,
+    )
+    if refs:
+        raise ModelSelectionError(
+            MODEL_SELECTION_REFERENCED, "resource is still referenced",
+            references=[ref.__dict__ for ref in refs],
+        )
+
+
+def upsert_model_group_resource(group: dict[str, Any]) -> dict[str, Any]:
+    from jiuwenswarm.common.model_errors import MODEL_GROUP_INVALID, ModelSelectionError
+
+    saved = deepcopy(group)
+    saved.setdefault("model_group_id", _new_business_id("mgp"))
+    # Legacy routing settings are inactive in model-pool mode.
+    saved.pop("routing", None)
+    for route in saved.get("routes") or []:
+        if isinstance(route, dict):
+            route.setdefault("route_id", _new_business_id("rte"))
+
+    def _mutate(data):
+        candidate = data.setdefault("models", {})
+        groups = candidate.setdefault("groups", [])
+        for index, current in enumerate(groups):
+            if current.get("model_group_id") == saved["model_group_id"]:
+                groups[index] = saved
+                break
+        else:
+            groups.append(saved)
+        if saved.get("is_default"):
+            for current in groups:
+                current["is_default"] = current["model_group_id"] == saved["model_group_id"]
+        _validate_model_candidate(candidate)
+        if saved.get("enabled", True) and not any(route.get("enabled", True) for route in saved["routes"]):
+            raise ModelSelectionError(MODEL_GROUP_INVALID, "enabled model group must contain an enabled route")
+        return data
+
+    update_config(_mutate)
+    return saved
+
+
+def delete_model_resource(resource_type: str, resource_id: str, *, cron_references_checked: bool = False) -> bool:
+    key = "groups" if resource_type == "model_group" else "defaults"
+    id_key = "model_group_id" if resource_type == "model_group" else "model_id"
+    deleted = False
+
+    def _mutate(data):
+        nonlocal deleted
+        candidate = data.setdefault("models", {})
+        if resource_type == "model":
+            _require_editable_model(candidate, resource_id)
+        entries = candidate.get(key) or []
+        filtered = [entry for entry in entries if entry.get(id_key) != resource_id]
+        if len(filtered) == len(entries):
+            return None
+        _require_unreferenced_model(data, resource_type, resource_id, cron_references_checked=cron_references_checked)
+        candidate[key] = filtered
+        _validate_model_candidate(candidate)
+        deleted = True
+        return data
+
+    update_config(_mutate)
+    return deleted
 
 
 def get_default_models(config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -1609,16 +1998,24 @@ def get_available_models(
     return [*configured, *extra]
 
 
-def update_default_models_in_config(models_list: list[dict[str, Any]]) -> None:
+def update_default_models_in_config(
+    models_list: list[dict[str, Any]], *, cron_references_checked: bool = False,
+) -> None:
     def _mutate(data):
         if "models" not in data:
             data["models"] = {}
+        retained_ids = {entry.get("model_id") for entry in models_list}
+        for previous in data["models"].get("defaults") or []:
+            model_id = previous.get("model_id")
+            if model_id and model_id not in retained_ids:
+                _require_unreferenced_model(data, "model", model_id, cron_references_checked=cron_references_checked)
         for entry in models_list:
             if isinstance(entry, dict) and isinstance(entry.get("alias"), str):
                 entry["alias"] = DoubleQuotedScalarString(entry["alias"])
         data["models"]["defaults"] = models_list
         if "default" in data["models"]:
             del data["models"]["default"]
+        _validate_model_candidate(data["models"])
         return data
     update_config(_mutate)
 
@@ -1985,13 +2382,65 @@ def _normalize_external_cli_team_config(
     transformed_team["external_transport"] = {"type": "hybrid", "params": params}
 
 
-def _normalize_external_cli_agents(value: Any, field_name: str) -> list[dict[str, str]]:
+def _normalize_builtin_models(value: Any, field_name: str) -> list[dict[str, Any]]:
+    """Normalize the built-in model catalog of one external CLI agent.
+
+    The catalog lists the models a CLI offers on its own login (a
+    subscription), which the team leader may pick per member through
+    ``spawn_external_cli(builtin_model=...)`` / ``set_member_model``. It is
+    carried through verbatim to ``ExternalCliAgentSpec.builtin_models``, so
+    dropping unknown keys here would silently disable the capability.
+
+    Args:
+        value: Raw ``builtin_models`` value from the config or the frontend.
+        field_name: Config path used in error messages.
+
+    Returns:
+        The normalized catalog; empty when nothing is declared.
+    """
     if value is None or value == "":
         return []
     if not isinstance(value, list):
         raise ValueError(f"{field_name} must be an array")
 
-    normalized: list[dict[str, str]] = []
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ValueError(f"{field_name}[{index}] must be an object")
+        name = str(item.get("name") or "").strip()
+        if not name:
+            raise ValueError(f"{field_name}[{index}].name must be a non-empty string")
+        if name in seen:
+            continue
+        seen.add(name)
+        entry: dict[str, Any] = {"name": name}
+        description = str(item.get("description") or "").strip()
+        if description:
+            entry["description"] = description
+        efforts_raw = item.get("efforts")
+        if efforts_raw is not None:
+            if not isinstance(efforts_raw, list):
+                raise ValueError(f"{field_name}[{index}].efforts must be an array")
+            efforts = [str(effort).strip() for effort in efforts_raw if str(effort).strip()]
+            if efforts:
+                entry["efforts"] = efforts
+        default_effort = str(item.get("default_effort") or "").strip()
+        if default_effort:
+            if default_effort not in entry.get("efforts", []):
+                raise ValueError(f"{field_name}[{index}].default_effort must be one of its efforts")
+            entry["default_effort"] = default_effort
+        normalized.append(entry)
+    return normalized
+
+
+def _normalize_external_cli_agents(value: Any, field_name: str) -> list[dict[str, Any]]:
+    if value is None or value == "":
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"{field_name} must be an array")
+
+    normalized: list[dict[str, Any]] = []
     seen: set[str] = set()
     for index, item in enumerate(value):
         if isinstance(item, str):
@@ -2008,7 +2457,7 @@ def _normalize_external_cli_agents(value: Any, field_name: str) -> list[dict[str
         if cli_agent in seen:
             continue
         seen.add(cli_agent)
-        normalized_item = {"cli_agent": cli_agent}
+        normalized_item: dict[str, Any] = {"cli_agent": cli_agent}
         if isinstance(item, dict):
             cli_path = str(item.get("cli_path") or "").strip()
             legacy_codex_bin = str(item.get("codex_bin") or "").strip()
@@ -2016,6 +2465,12 @@ def _normalize_external_cli_agents(value: Any, field_name: str) -> list[dict[str
                 normalized_item["cli_path"] = cli_path
             elif cli_agent == "codex" and legacy_codex_bin:
                 normalized_item["cli_path"] = legacy_codex_bin
+            builtin_models = _normalize_builtin_models(
+                item.get("builtin_models"),
+                f"{field_name}[{index}].builtin_models",
+            )
+            if builtin_models:
+                normalized_item["builtin_models"] = builtin_models
         normalized.append(normalized_item)
     return normalized
 
@@ -2077,6 +2532,17 @@ def replace_teams_in_config(front_payload: dict[str, Any]) -> None:
             data.get("web_config_panel", {}).pop("agent_team_agents", None)
     if "modes" not in data or not isinstance(data["modes"], dict):
         data["modes"] = {}
+    # The team editor payload carries no built-in model catalog, so the one
+    # configured for each CLI kind is carried over from the current config.
+    existing_teams = data["modes"].get("team")
+    if isinstance(existing_teams, dict):
+        for team_name, transformed_team in team_mapping.items():
+            existing_team = existing_teams.get(team_name)
+            if not isinstance(existing_team, dict):
+                continue
+            agents = transformed_team.get("external_cli_agents")
+            if isinstance(agents, list):
+                _carry_over_builtin_models(agents, existing_team.get("external_cli_agents"))
     data["modes"]["team"] = team_mapping
     dump_yaml_round_trip(CONFIG_YAML_PATH, data)
 
@@ -2103,6 +2569,52 @@ def update_swarmflow_enabled_in_config(enabled: bool) -> None:
     dump_yaml_round_trip(CONFIG_YAML_PATH, data)
 
 
+def _set_config_path(path: tuple[str, ...], value: Any) -> None:
+    data = load_yaml_round_trip(CONFIG_YAML_PATH)
+    current = data
+    path_so_far: list[str] = []
+    for segment in path[:-1]:
+        path_so_far.append(segment)
+        current = _ensure_config_object(current, segment, ".".join(path_so_far))
+    current[path[-1]] = value
+    dump_yaml_round_trip(CONFIG_YAML_PATH, data)
+
+
+def update_team_scheduled_dispatch_in_config(enabled: bool) -> None:
+    """Update ``modes.team.jiuwen_team.dispatch_mode`` (scheduled / autonomous)."""
+    _set_config_path(TEAM_DISPATCH_MODE_CONFIG_PATH, "scheduled" if enabled else "autonomous")
+
+
+def update_team_task_verification_in_config(enabled: bool) -> None:
+    """Update ``modes.team.jiuwen_team.enable_task_verification`` in config.yaml."""
+    _set_config_path(TEAM_TASK_VERIFICATION_CONFIG_PATH, bool(enabled))
+
+
+def _carry_over_builtin_models(agents: list[dict[str, Any]], existing: Any) -> None:
+    """Keep the configured built-in model catalog of each CLI kind.
+
+    Args:
+        agents: Normalized entries about to be written; mutated in place.
+        existing: The ``external_cli_agents`` value currently in the config.
+    """
+    if not isinstance(existing, list):
+        return
+    catalogs: dict[str, Any] = {}
+    for item in existing:
+        if not isinstance(item, dict):
+            continue
+        cli_agent = str(item.get("cli_agent") or "").strip()
+        builtin_models = item.get("builtin_models")
+        if cli_agent and builtin_models:
+            catalogs[cli_agent] = builtin_models
+    for entry in agents:
+        if "builtin_models" in entry:
+            continue
+        carried = catalogs.get(entry["cli_agent"])
+        if carried:
+            entry["builtin_models"] = carried
+
+
 def update_external_cli_agents_in_config(agents: list[str | dict[str, Any]], publish_url: str | None = None) -> None:
     """Update the external CLI agent switches for the default team."""
     data = load_yaml_round_trip(CONFIG_YAML_PATH)
@@ -2113,6 +2625,9 @@ def update_external_cli_agents_in_config(agents: list[str | dict[str, Any]], pub
         current = _ensure_config_object(current, segment, ".".join(path_so_far))
 
     normalized_agents = _normalize_external_cli_agents(agents, "external_cli_agents")
+    # The switch payload only names the CLI kinds, so the built-in model
+    # catalog already configured for a kind must survive the rewrite.
+    _carry_over_builtin_models(normalized_agents, current.get(EXTERNAL_CLI_AGENTS_CONFIG_PATH[-1]))
     if normalized_agents:
         current[EXTERNAL_CLI_AGENTS_CONFIG_PATH[-1]] = normalized_agents
     else:
@@ -2139,6 +2654,42 @@ def update_external_cli_agents_in_config(agents: list[str | dict[str, Any]], pub
         current.pop(EXTERNAL_TRANSPORT_CONFIG_PATH[-1], None)
 
     dump_yaml_round_trip(CONFIG_YAML_PATH, data)
+
+
+def update_external_cli_builtin_models_in_config(catalogs: dict[str, list[dict[str, Any]]]) -> None:
+    """Replace the built-in model catalog of the named CLI kinds.
+
+    Args:
+        catalogs: ``cli_agent`` to its corrected catalog; an empty catalog
+            removes the key, leaving that kind on the CLI's default model.
+    """
+    if not catalogs:
+        return
+    data = load_yaml_round_trip(CONFIG_YAML_PATH)
+    current = data
+    for segment in EXTERNAL_CLI_AGENTS_CONFIG_PATH[:-1]:
+        nested = current.get(segment) if isinstance(current, dict) else None
+        if not isinstance(nested, dict):
+            return
+        current = nested
+    entries = current.get(EXTERNAL_CLI_AGENTS_CONFIG_PATH[-1])
+    if not isinstance(entries, list):
+        return
+
+    changed = False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        catalog = catalogs.get(str(entry.get("cli_agent") or "").strip())
+        if catalog is None:
+            continue
+        if catalog:
+            entry["builtin_models"] = catalog
+        else:
+            entry.pop("builtin_models", None)
+        changed = True
+    if changed:
+        dump_yaml_round_trip(CONFIG_YAML_PATH, data)
 
 
 def reset_external_cli_agents_in_config() -> None:
@@ -2683,6 +3234,8 @@ def migrate_config_from_template(
 ) -> bool:
     """Sync user config with template structure, preserving user values.
 
+    AgentOS configuration is managed by deployment and skips this migration.
+
     Merge:
     - Add: new fields from template (new config options)
     - Keep: user values for fields that exist in template
@@ -2707,6 +3260,11 @@ def migrate_config_from_template(
     Returns:
         True if migration was performed, False otherwise.
     """
+    from jiuwenswarm.common.agentos_runtime import is_agentos_runtime
+
+    if is_agentos_runtime():
+        return False
+
     if not user_config_path.exists():
         return False
 
@@ -2979,7 +3537,7 @@ def resolve_sandbox_enabled(sandbox: Any) -> bool:
     if "enabled" in sandbox:
         return bool(sandbox["enabled"])
     return (
-        str(sandbox.get("type") or "").strip().lower() == "jiuwenbox"
+        str(sandbox.get("type") or "").strip().lower() in {"jiuwenbox", "jiuwenbox-conch"}
         and bool(str(sandbox.get("url") or "").strip())
         and bool(str(sandbox.get("control_token_path") or "").strip())
     )
@@ -3044,6 +3602,8 @@ _YUANRONG_ENDPOINT_OPTIONAL_KEYS: tuple[str, ...] = (
     "memory",
     "mem_limit",
     "rootfs",
+    "user",
+    "group",
 )
 
 # Public re-exports for callers that need to fall back to / advertise defaults
@@ -3305,7 +3865,8 @@ def get_sandbox_endpoint() -> dict[str, Any]:
     当 ``type=yuanrong`` 时额外返回:
     - ``executor`` (缺省 ``docker``)
     - 若 yaml 中存在: ``image`` / ``workdir`` / ``mounts`` / ``cpu`` /
-      ``cpu_limit`` / ``memory`` / ``mem_limit`` / ``rootfs``
+      ``cpu_limit`` / ``memory`` / ``mem_limit`` / ``rootfs`` /
+      ``user`` / ``group``
     - ``url`` 为空时回落占位 ``http://yuanrong.local`` (仅作 cache key)
 
     Raises:
@@ -3329,6 +3890,10 @@ def get_sandbox_endpoint() -> dict[str, Any]:
         result["url"] = url or _DEFAULT_YUANRONG_URL
         result["executor"] = _normalize_yuanrong_executor(sandbox.get("executor"))
         for key in _YUANRONG_ENDPOINT_OPTIONAL_KEYS:
+            if key in sandbox:
+                result[key] = sandbox[key]
+    if sandbox_type == "jiuwenbox-conch":
+        for key in ("template_name", "user", "group", "conch"):
             if key in sandbox:
                 result[key] = sandbox[key]
     return result

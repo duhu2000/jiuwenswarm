@@ -454,7 +454,7 @@ async def test_harmonyos_dev_init_legacy_client_falls_back_to_local(monkeypatch)
         return {"ok": True, "source": "local-fallback"}
 
     monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.harmonyos.harmonyos_dev.run_harmonyos_dev_init",
+        "jiuwenswarm.gateway.embedded.runtime.harmonyos.harmonyos_dev.run_harmonyos_dev_init",
         fake_local_init,
     )
 
@@ -504,7 +504,7 @@ async def test_harmonyos_dev_init_remote_client_error_without_fallback(monkeypat
         return {"ok": True}
 
     monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.harmonyos.harmonyos_dev.run_harmonyos_dev_init",
+        "jiuwenswarm.gateway.embedded.runtime.harmonyos.harmonyos_dev.run_harmonyos_dev_init",
         fake_local_init,
     )
 
@@ -564,7 +564,7 @@ async def test_harmonyos_dev_init_business_failure_does_not_rerun_locally(monkey
         return {"ok": True}
 
     monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.harmonyos.harmonyos_dev.run_harmonyos_dev_init",
+        "jiuwenswarm.gateway.embedded.runtime.harmonyos.harmonyos_dev.run_harmonyos_dev_init",
         fake_local_init,
     )
 
@@ -1401,17 +1401,24 @@ def test_model_meta_index_field_matches_raw_defaults_position():
 
 
 # ── 单用户 AgentServer 不可达时的本地回落（P2 遗留修复回归） ──────────────────
+# Front 控制面 RPC（session.list/color_set/preview）离线时不得由 Gateway 顶替。
 
 def _offline_local_client() -> WebSocketAgentServerClient:
     """server_ready=False 的本地 WebSocketAgentServerClient（共享目录单用户）。"""
     return WebSocketAgentServerClient()  # server_ready defaults to False
 
 
+def _assert_control_method_unavailable(server: FakeGatewayServer) -> None:
+    resp = server.responses[-1]
+    assert resp["ok"] is False
+    assert resp["code"] == "SERVICE_UNAVAILABLE"
+
+
 @pytest.mark.asyncio
-async def test_session_color_set_falls_back_to_local_adapter_when_agent_offline(
+async def test_session_color_set_unavailable_when_agent_offline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AgentServer 不可达时，TUI session.color_set 经薄代理回落到本地适配器查询。"""
+    """session.color_set is Front Control; Gateway must not run a local adapter."""
     server = FakeGatewayServer()
     register_cli_handlers(
         CliHandlersBindParams(
@@ -1431,15 +1438,14 @@ async def test_session_color_set_falls_back_to_local_adapter_when_agent_offline(
         object(), "req-color", {"session_id": "sess-1"}, "sess-1"
     )
 
-    assert server.responses[-1]["ok"] is True
-    assert server.responses[-1]["payload"]["accent_color"] == "blue"
+    _assert_control_method_unavailable(server)
 
 
 @pytest.mark.asyncio
-async def test_session_list_falls_back_to_local_adapter_when_agent_offline(
+async def test_session_list_unavailable_when_agent_offline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """TUI resume list must not become empty during a local AgentServer restart."""
+    """session.list is Front Control; Gateway must not run a local adapter."""
     server = FakeGatewayServer()
     register_cli_handlers(
         CliHandlersBindParams(
@@ -1462,15 +1468,14 @@ async def test_session_list_falls_back_to_local_adapter_when_agent_offline(
         object(), "req-list", {"all_projects": True}, "current"
     )
 
-    assert server.responses[-1]["ok"] is True
-    assert server.responses[-1]["payload"]["sessions"][0]["session_id"] == "legacy"
+    _assert_control_method_unavailable(server)
 
 
 @pytest.mark.asyncio
-async def test_session_preview_falls_back_to_local_adapter_when_agent_offline(
+async def test_session_preview_unavailable_when_agent_offline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AgentServer 不可达时，TUI session.preview 经薄代理回落到本地适配器。"""
+    """session.preview is Front Control; Gateway must not run a local adapter."""
     server = FakeGatewayServer()
     register_cli_handlers(
         CliHandlersBindParams(
@@ -1493,16 +1498,12 @@ async def test_session_preview_falls_back_to_local_adapter_when_agent_offline(
         object(), "req-preview", {"session_id": "sess-1"}, "sess-1"
     )
 
-    assert server.responses[-1]["ok"] is True
-    messages = server.responses[-1]["payload"]["preview_messages"]
-    assert [m["role"] for m in messages] == ["user", "assistant"]
+    _assert_control_method_unavailable(server)
 
 
 @pytest.mark.asyncio
-async def test_session_delete_falls_back_to_shared_dir_when_agent_offline(
-    monkeypatch: pytest.MonkeyPatch, tmp_path,
-) -> None:
-    """AgentServer 不可达时，TUI session.delete 恢复迁移前本地删除路径。"""
+async def test_session_delete_unavailable_when_agent_offline() -> None:
+    """session.delete is execution-plane; Gateway must not run a local adapter."""
     server = FakeGatewayServer()
     register_cli_handlers(
         CliHandlersBindParams(
@@ -1513,33 +1514,12 @@ async def test_session_delete_falls_back_to_shared_dir_when_agent_offline(
             path="/tui",
         )
     )
-    session_dir = tmp_path / "sessions" / "sess-del"
-    session_dir.mkdir(parents=True)
-    monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.session.session_metadata.get_session_metadata",
-        lambda *args, **kwargs: {"mode": "agent"},
-    )
-    monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.session.session_history.resolve_session_dir",
-        lambda *args, **kwargs: (session_dir, None),
-    )
-
-    class _Session:
-        async def release_kvc(self):
-            return True
-
-    monkeypatch.setattr(
-        "openjiuwen.core.session.agent.create_agent_session",
-        lambda **_kwargs: _Session(),
-    )
 
     await server.local_handlers["/tui"]["session.delete"](
         object(), "req-del", {"session_id": "sess-del"}, "sess-del"
     )
 
-    assert server.responses[-1]["ok"] is True
-    assert server.responses[-1]["payload"] == {"session_id": "sess-del"}
-    assert not session_dir.exists()
+    _assert_control_method_unavailable(server)
 
 
 @pytest.mark.asyncio
@@ -1569,15 +1549,15 @@ async def test_session_rebind_project_falls_back_to_shared_dir_when_agent_offlin
         },
     )
     monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.session.session_metadata.get_session_metadata",
+        "jiuwenswarm.gateway.embedded.runtime.session.session_metadata.get_session_metadata",
         lambda *args, **kwargs: {"session_id": "sess-1"},
     )
     monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.session.project_store.find_or_create_code_project_for_tui_params",
+        "jiuwenswarm.gateway.embedded.runtime.session.project_store.find_or_create_code_project_for_tui_params",
         lambda *args, **kwargs: project,
     )
     monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.session.session_metadata.rebind_session_project",
+        "jiuwenswarm.gateway.embedded.runtime.session.session_metadata.rebind_session_project",
         lambda *args, **kwargs: True,
     )
 
@@ -1606,7 +1586,7 @@ async def test_session_rebind_project_does_not_read_gateway_state_for_remote_cli
         CliHandlersBindParams(channel=server, agent_client=RemoteAgentClient(), path="/tui")
     )
     monkeypatch.setattr(
-        "jiuwenswarm.server.runtime.session.session_metadata.get_session_metadata",
+        "jiuwenswarm.gateway.embedded.runtime.session.session_metadata.get_session_metadata",
         lambda *args, **kwargs: pytest.fail("remote fallback must not read Gateway session state"),
     )
 

@@ -38,7 +38,7 @@ class RegistryConfig:
     """Gateway → registry connection settings.
 
     ``endpoint`` empty → local stub (no HTTP). ``node`` is this machine's
-    nodeIP written into registered instances.
+    nodeIP for ``POST /api/nodes/{node}/heartbeat``, not instance placement.
     """
 
     endpoint: str = ""
@@ -697,10 +697,11 @@ class RegistryClient:
             or info.metadata.get("framework_version")
             or "default"
         ).strip()
+        # Placement node is YuanRong node_ip, patched after running. Do not
+        # stamp Gateway heartbeat IP (RegistryConfig.node) as the sandbox site.
         node = str(
             info.metadata.get("node")
             or sandbox_meta.get("node")
-            or self.node
             or ""
         ).strip()
         instance_id = str(
@@ -709,12 +710,11 @@ class RegistryClient:
             or sandbox_meta.get("instance_id")
             or ""
         ).strip()
-        # Registry rejects empty address. Placement IP is patched after
-        # YuanRong get_agent_info; until then reuse instance_id.
+        # Placement IP is patched after YuanRong get_agent_info. The first
+        # POST leaves address empty, same as node, until that IP exists.
         address = str(
             info.metadata.get("address")
             or sandbox_meta.get("address")
-            or instance_id
             or ""
         ).strip()
         kind = str(info.metadata.get("kind") or resolve_instance_kind(framework)).strip()
@@ -776,7 +776,8 @@ class RegistryClient:
         if self.enabled:
             await self.unregister_instance(service_id)
 
-    def _instance_record_from_agent(self, info: AgentInfo) -> InstanceRecord:
+    @staticmethod
+    def _instance_record_from_agent(info: AgentInfo) -> InstanceRecord:
         user = str(info.user_id or "").strip()
         framework = str(info.agent_type or "").strip()
         sandbox_meta = info.metadata.get("sandbox")
@@ -788,7 +789,7 @@ class RegistryClient:
             framework=framework,
             framework_version=str(info.metadata.get("framework_version") or "default").strip(),
             node=str(
-                info.metadata.get("node") or sandbox_meta.get("node") or self.node or ""
+                info.metadata.get("node") or sandbox_meta.get("node") or ""
             ).strip(),
             address=str(
                 info.metadata.get("address") or sandbox_meta.get("address") or ""

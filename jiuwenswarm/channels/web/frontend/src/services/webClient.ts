@@ -203,15 +203,6 @@ class WebClient {
           this.updateState('closed');
           return;
         }
-        // 1008 Policy Violation: gateway 鉴权失败 (token 失效/缺失)。
-        // 重载页面, AppWithAuth 会探测 cookie 失效 -> 回到登录页。
-        if (closeEvent.code === 1008) {
-          this.updateState('closed');
-          if (typeof window !== 'undefined') {
-            window.location.reload();
-          }
-          return;
-        }
         this.scheduleReconnect();
       };
     });
@@ -785,8 +776,15 @@ export async function sendGoalStreamCommand(params: {
   objective?: string;
   mode?: string;
   modelName?: string | null;
+  modelParams?: Record<string, unknown>;
 }): Promise<void> {
-  const { sessionId, action, objective, mode, modelName } = params;
+  const { sessionId, action, objective, mode, modelName, modelParams } = params;
+  const outgoingModel =
+    modelParams && Object.keys(modelParams).length > 0
+      ? modelParams
+      : modelName
+        ? { model_name: modelName }
+        : {};
   await webClient.sendFireAndForget(
     'command.goal',
     {
@@ -794,7 +792,7 @@ export async function sendGoalStreamCommand(params: {
       action,
       mode: mode ?? 'agent',
       ...(action === 'set' ? { objective, overwrite_confirmed: true } : {}),
-      ...(modelName ? { model_name: modelName } : {}),
+      ...outgoingModel,
     },
     { isStream: true }
   );

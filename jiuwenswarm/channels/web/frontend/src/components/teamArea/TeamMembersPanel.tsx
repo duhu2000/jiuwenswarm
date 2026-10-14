@@ -1,8 +1,13 @@
-import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import { useOrganizationConversationKey } from '../../features/teamOrganization/conversation';
+import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useChatStore, useSessionStore, useTodoStore } from '../../stores';
 import type { Message, TeamMemberContextCompressionState } from '../../types';
 import type { TeamMemberExecutionEvent, TeamTask as SessionTeamTask } from '../../stores/sessionStore';
+import {
+  shouldPresentTeamMemberIdle,
+  type TeamConnectionPresentation,
+} from '../../features/teamConnectionPresentation';
 import { MarkdownMessageBody } from '../ChatPanel/MessageItem';
 import { parseTeamEventMessage, type ParsedTeamEvent } from '../ChatPanel/teamEventUtils';
 import { TeamMemberAvatar } from '../TeamMemberAvatar';
@@ -10,8 +15,8 @@ import { isTeamLeaderMember, isUserMember } from '../../utils/teamMemberAvatar';
 import { contextCompressionRunningText } from '../../utils/contextCompression';
 import { getSkillAvatar } from '../../utils/skillAvatar';
 import teamIcon from '../../assets/team.svg';
-import PendingIcon from '../../assets/pending.svg?react';
-import LoadingIcon from '../../assets/subagent/loading.svg?react';
+import FrameTimeIcon from '../../assets/work-mode/frame-time.svg?react';
+import { LoadingSpinner } from '../ui/LoadingSpinner/LoadingSpinner';
 
 import BackIcon from '../../assets/back.svg?react';
 import { MemberListItem } from './MemberListItem';
@@ -21,6 +26,8 @@ import { MemberTaskListBar, MemberTaskListPanel } from './MemberTaskList';
 import {
   buildProcessItems,
   buildTaskMap,
+  getMemberAvatarIdentity,
+  getMemberAvatarKey,
   getMemberDisplayName,
   getMemberStatusKey,
   latestUserPrompt,
@@ -29,11 +36,14 @@ import {
   type TeamMember,
 } from './shared';
 import { AlertTriangle, CircleAlert, LoaderCircle, X } from 'lucide-react';
+import { groupByWorkflowRun, type WorkflowRunGroup } from './runGrouping';
+import { RunGroupHeader } from './RunGroupHeader';
 
 type TeamMembersPanelProps = {
   variant: 'compact' | 'expanded';
   members: TeamMember[];
   tasks?: SessionTeamTask[];
+  connectionPresentation?: TeamConnectionPresentation | null;
   selectedMemberId?: string;
   selectedMember?: TeamMember | null;
   activeDetailTab?: TeamDetailTab;
@@ -107,6 +117,7 @@ export function TeamMembersPanel({
   variant,
   members,
   tasks = [],
+  connectionPresentation = null,
   selectedMemberId = '',
   selectedMember = null,
   activeDetailTab = 'members',
@@ -116,7 +127,7 @@ export function TeamMembersPanel({
   onDetailTabChange,
 }: TeamMembersPanelProps) {
   const { t } = useTranslation();
-  const activeSessionId = useChatStore((s) => s.activeSessionId);
+  const activeSessionId = useOrganizationConversationKey(useChatStore((s) => s.activeSessionId));
   const messages = useChatStore((s) => s.runtimes[activeSessionId ?? '']?.messages ?? []);
   const teamLeaderMemberIds = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.teamLeaderMemberIds ?? []);
   const groupMessages = useMemo(() => buildGroupMessageItems(historyMessages, messages), [historyMessages, messages]);
@@ -143,6 +154,12 @@ export function TeamMembersPanel({
     });
     return progress;
   }, [tasks, visibleMembers]);
+  // 镜像的 swarmflow worker 按 run 分组展示；真实队友（无 workflow_run_id）平铺。
+  const workflowRuns = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.workflowRuns ?? []);
+  const memberRunGroups = useMemo(
+    () => groupByWorkflowRun(visibleMembers, workflowRuns),
+    [visibleMembers, workflowRuns],
+  );
 
   if (variant === 'compact') {
     return (
@@ -168,15 +185,20 @@ export function TeamMembersPanel({
               {t('team.noMemberData')}
             </div>
           ) : (
-            visibleMembers.map((member) => (
-              <MemberListItem
-                key={member.member_id}
-                member={member}
-                compact
-                taskProgress={memberTaskProgress[member.member_id]}
-                onClick={() => onMemberClick?.(member.member_id)}
-              />
-            ))
+            <MemberRunGroupedList
+              ungrouped={memberRunGroups.ungrouped}
+              groups={memberRunGroups.groups}
+              renderRow={(member) => (
+                <MemberListItem
+                  key={member.member_id}
+                  member={member}
+                  compact
+                  showIdleStatus={shouldPresentTeamMemberIdle(member.member_id, member.status, connectionPresentation)}
+                  taskProgress={memberTaskProgress[member.member_id]}
+                  onClick={() => onMemberClick?.(member.member_id)}
+                />
+              )}
+            />
           )}
         </div>
       </div>
@@ -231,14 +253,19 @@ export function TeamMembersPanel({
               {t('team.noMemberData')}
             </div>
           ) : (
-            visibleMembers.map((member) => (
-              <MemberListItem
-                key={member.member_id}
-                member={member}
-                selected={visibleSelectedMember?.member_id === member.member_id}
-                onClick={() => onSelectMember?.(member.member_id)}
-              />
-            ))
+            <MemberRunGroupedList
+              ungrouped={memberRunGroups.ungrouped}
+              groups={memberRunGroups.groups}
+              renderRow={(member) => (
+                <MemberListItem
+                  key={member.member_id}
+                  member={member}
+                  selected={visibleSelectedMember?.member_id === member.member_id}
+                  showIdleStatus={shouldPresentTeamMemberIdle(member.member_id, member.status, connectionPresentation)}
+                  onClick={() => onSelectMember?.(member.member_id)}
+                />
+              )}
+            />
           )}
         </div>
       </aside>
@@ -256,6 +283,7 @@ export function TeamMembersPanel({
         <MemberOverviewPanel
           members={visibleMembers}
           tasks={tasks}
+          connectionPresentation={connectionPresentation}
           historyMessages={historyMessages}
           onMemberClick={(memberId) => onSelectMember?.(memberId)}
         />
@@ -392,11 +420,13 @@ function GroupChatMessage({ event }: { event: ParsedTeamEvent }) {
 function MemberOverviewPanel({
   members,
   tasks,
+  connectionPresentation,
   historyMessages,
   onMemberClick,
 }: {
   members: TeamMember[];
   tasks: SessionTeamTask[];
+  connectionPresentation: TeamConnectionPresentation | null;
   historyMessages?: Message[];
   onMemberClick: (memberId: string) => void;
 }) {
@@ -420,6 +450,7 @@ function MemberOverviewPanel({
                 member={member}
                 sequence={index + 1}
                 tasks={tasks}
+                connectionPresentation={connectionPresentation}
                 historyMessages={historyMessages}
                 onClick={() => onMemberClick(member.member_id)}
               />
@@ -435,17 +466,19 @@ const TeamMemberOverviewCard = memo(function TeamMemberOverviewCard({
   member,
   sequence,
   tasks,
+  connectionPresentation,
   historyMessages = [],
   onClick,
 }: {
   member: TeamMember;
   sequence: number;
   tasks?: SessionTeamTask[];
+  connectionPresentation: TeamConnectionPresentation | null;
   historyMessages?: Message[];
   onClick?: () => void;
 }) {
   const { t } = useTranslation();
-  const activeSessionId = useChatStore((s) => s.activeSessionId);
+  const activeSessionId = useOrganizationConversationKey(useChatStore((s) => s.activeSessionId));
   const todos = useTodoStore((s) => s.runtimes[activeSessionId ?? '']?.todos ?? []);
   const teamTaskEvents = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.teamTaskEvents ?? []);
   const teamMemberExecutionEvents = useSessionStore(
@@ -471,15 +504,18 @@ const TeamMemberOverviewCard = memo(function TeamMemberOverviewCard({
   const displayName = getMemberDisplayName(member);
   const statusKey = getMemberStatusKey(member);
   const isRunning = statusKey === 'running';
-  const statusIcon = isRunning ? (
-    <LoadingIcon className="h-4 w-4 shrink-0 text-muted animate-spin" />
+  const showIdleStatus = shouldPresentTeamMemberIdle(member.member_id, member.status, connectionPresentation);
+  const statusIcon = isRunning && !showIdleStatus ? (
+    <LoadingSpinner />
   ) : (
-    <PendingIcon className="w-4 h-4 shrink-0 text-text-muted" />
+    <FrameTimeIcon className="w-4 h-4 shrink-0 text-text-meta" />
   );
 
   return (
     <MemberOverviewCard
       memberId={member.member_id}
+      avatarKey={getMemberAvatarKey(member)}
+      avatarIdentity={getMemberAvatarIdentity(member)}
       displayName={displayName}
       sequence={sequence}
       statusIcon={statusIcon}
@@ -515,7 +551,7 @@ function MemberTaskDetail({
       document.removeEventListener('mousedown', handlePointerDown);
     };
   }, [taskListExpanded]);
-  const activeSessionId = useChatStore((s) => s.activeSessionId);
+  const activeSessionId = useOrganizationConversationKey(useChatStore((s) => s.activeSessionId));
   const todos = useTodoStore((s) => s.runtimes[activeSessionId ?? '']?.todos ?? []);
   const teamTaskEvents = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.teamTaskEvents ?? []);
   const teamMemberExecutionEvents = useSessionStore(
@@ -715,11 +751,11 @@ function FinalSummaryList({ events }: { events: TeamMemberExecutionEvent[] }) {
 
   return (
     <div className="mt-5 border-t border-[var(--color-team-detail-divider)] pt-4" data-testid="team-area-final-summary">
-      <div className="mt-4 space-y-6">
+      <div className="mt-4">
         {events.map((event) => (
           <section
             key={event.id}
-            className="space-y-3"
+            className="my-4 space-y-3"
             data-testid="team-area-final-summary-item"
             data-variant={event.id}
           >
@@ -733,5 +769,36 @@ function FinalSummaryList({ events }: { events: TeamMemberExecutionEvent[] }) {
         ))}
       </div>
     </div>
+  );
+}
+
+/**
+ * 成员列表的运行分组渲染：无 run 的成员平铺，镜像 worker 按 run 分组，
+ * 每组前插共享 RunGroupHeader。行内容（MemberListItem 的具体 props）由调用方决定。
+ */
+function MemberRunGroupedList({
+  ungrouped,
+  groups,
+  renderRow,
+}: {
+  ungrouped: TeamMember[];
+  groups: WorkflowRunGroup<TeamMember>[];
+  renderRow: (member: TeamMember) => ReactNode;
+}) {
+  return (
+    <>
+      {ungrouped.map(renderRow)}
+      {groups.map((group) => (
+        <div key={group.runId}>
+          <RunGroupHeader
+            name={group.name}
+            shortId={group.shortId}
+            status={group.status}
+            runId={group.runId}
+          />
+          {group.items.map(renderRow)}
+        </div>
+      ))}
+    </>
   );
 }

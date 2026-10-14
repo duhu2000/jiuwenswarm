@@ -14,6 +14,7 @@ import uuid
 
 from jiuwenswarm.extensions.video_duplex.backend import (
     joyai_provider,
+    settings,
     video_search,
     video_voice,
 )
@@ -167,7 +168,7 @@ def _is_allowed_image_data_url(value: str) -> bool:
 
 
 def _video_live_mode() -> str:
-    mode = os.environ.get("VIDEO_LIVE_MODE", "joyai").strip().casefold()
+    mode = os.environ.get("VIDEO_LIVE_MODE", "realtime").strip().casefold()
     return "realtime" if mode == "realtime" else "joyai"
 
 
@@ -219,7 +220,7 @@ def register_video_live_handler(
                 return
             await channel.send_response(
                 ws, req_id, ok=True,
-                payload={"provider": "joyai", "model": model},
+                payload={"provider": "joyai", "model": model, "reply_language": settings.reply_language()},
             )
             return
         config = QwenOmniRealtimeConfig.from_environment()
@@ -244,6 +245,7 @@ def register_video_live_handler(
                 "model": config.model,
                 "voice": config.voice,
                 "tools": qwen_omni_tools(),
+                "reply_language": settings.reply_language(),
             },
         )
 
@@ -256,6 +258,9 @@ def register_video_live_handler(
         question = str(params.get("question") or "").strip()
         tool_context = str(params.get("tool_context") or "").strip()
         frame_time_range = str(params.get("frame_time_range") or "").strip()
+        reply_language = joyai_provider.normalize_response_language(
+            params.get("reply_language", settings.reply_language())
+        )
         request_kind = str(params.get("request_kind") or "frame").strip().casefold()
         if not _is_allowed_image_data_url(frame_data_url):
             await channel.send_response(
@@ -336,7 +341,7 @@ def register_video_live_handler(
         await asyncio.to_thread(_append_joyai_log, {**request_log, "stage": "requested"})
         try:
             model_instruction = (
-                joyai_provider.ground_user_instruction(instruction, tool_context)
+                joyai_provider.ground_user_instruction(instruction, tool_context, reply_language)
                 if request_kind == "user"
                 else instruction
             )
@@ -379,7 +384,7 @@ def register_video_live_handler(
                 value = json.loads(delegation)
                 if not isinstance(value, dict) or set(value) != {"name", "arguments"}:
                     raise ValueError("Invalid task operation")
-                if value["name"] not in {
+                if value.get("name") not in {
                     "jiuwen_delegate",
                     "jiuwen_task_query",
                     "jiuwen_task_modify",
@@ -397,7 +402,7 @@ def register_video_live_handler(
                 )
                 if call.name == "jiuwen_delegate":
                     scheduling = {
-                        k: call.arguments[k]
+                        k: call.arguments.get(k)
                         for k in ("independent", "depends_on", "resources")
                         if k in call.arguments
                     }
@@ -673,6 +678,7 @@ def register_video_live_handler(
         **voice_handlers,
         "video.qwen.tool": search_manager.handle_qwen_tool,
         "video.search.status": search_manager.handle_status,
+        "video.search.answer": search_manager.handle_answer,
         "video.search.list": search_manager.handle_list,
         "video.search.control": search_manager.handle_control,
     }

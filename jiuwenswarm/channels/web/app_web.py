@@ -15,7 +15,6 @@ import json
 import logging
 import mimetypes
 import os
-import posixpath
 import re
 import select
 import signal
@@ -55,6 +54,15 @@ if TYPE_CHECKING:
 
 _share_image_export_manager: ShareImageExportManager | None = None
 _share_image_export_manager_lock = threading.Lock()
+
+
+class _BadRequestError(ValueError):
+    """Client-supplied input the web handler cannot process.
+
+    Raised for values that must be rejected with ``400`` instead of letting the
+    exception escape the request handler (which drops the connection without a
+    response and logs a traceback for every malformed request).
+    """
 
 
 def _get_share_image_export_manager() -> ShareImageExportManager:
@@ -294,11 +302,6 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
 
     api_target = ""
     ws_target = ""
-    # control-panel (IAM) base URL for /auth-api/*, e.g. http://127.0.0.1:8090
-    iam_target = ""
-    # 一体机模式标记: jiuwenswarm-web --remote 开启。
-    # 仅一体机场景为 True; 普通部署为 False。前端据此决定是否显示登出按钮。
-    remote_mode = False
     ws_disable_compress = False
 
     # --- 桌面对话页面限制: 启动 token + HttpOnly Cookie ---
@@ -310,13 +313,6 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
     desktop_cookie_name = "__wsdt"
     _DESKTOP_TOKEN_QUERY_PARAM = "dt"
 
-    # --- /auth-api cookie-based auth bridge ---
-    # access_token 实测 TTL 15min(900s), refresh_token 实测 7d(604800s)。
-    _AUTH_COOKIE_NAME = "jw_token"
-    _AUTH_COOKIE_MAX_AGE = 900
-    _AUTH_REFRESH_COOKIE_NAME = "jw_refresh"
-    _AUTH_REFRESH_MAX_AGE = 7 * 24 * 3600
-    _AUTH_API_PREFIX = "/auth-api"
     project_root = _get_user_workspace_dir()
     workspace_root = _get_agent_root_dir()
     agent_teams_root = _get_agent_teams_root(project_root)
@@ -344,6 +340,7 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
     _WS_LOG_MAX_CHARS = 2000
     _HTTP_PROXY_TIMEOUT = 30
     _WS_CONNECT_TIMEOUT = 10
+    _WS_HANDSHAKE_TIMEOUT = 10
     _WS_SELECT_TIMEOUT = 60
     _WS_RECV_BUFFER = 65536
     _WS_HANDSHAKE_MAX_SIZE = 65536
@@ -509,29 +506,6 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
     def _is_api_route(self) -> bool:
         return urlparse(self.path).path.startswith("/api")
 
-    def _is_auth_api_route(self) -> bool:
-        # /auth-api/* 反代到 control-panel (IAM),浏览器侧走 HttpOnly cookie
-        return urlparse(self.path).path.startswith(self._AUTH_API_PREFIX + "/")
-
-    def _is_web_config_route(self) -> bool:
-        # /api/web-config: 本地端点, 返回 web 启动配置(如一体机模式标记)。
-        # 必须在 _is_api_route 之前判定, 否则会被当 /api/* 反代到 gateway。
-        return urlparse(self.path).path == "/api/web-config"
-
-    def _handle_web_config(self) -> None:
-        """返回 web 启动配置 JSON, 供前端探测(如一体机模式 → 显示登出按钮, IAM 是否启用)。"""
-        payload = {
-            "remote": bool(self.remote_mode),
-            "iam_enabled": bool(self.iam_target),
-        }
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
-
     def _is_ws_route(self) -> bool:
         return urlparse(self.path).path.startswith("/ws")
 
@@ -540,6 +514,9 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
 
     def _is_share_api_route(self) -> bool:
         return urlparse(self.path).path.startswith("/share-api/")
+
+    def _is_skill_sync_route(self) -> bool:
+        return urlparse(self.path).path.startswith("/skill-sync/")
 
     def _is_websocket_upgrade(self) -> bool:
         upgrade = self.headers.get("Upgrade", "")
@@ -681,136 +658,6 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
         finally:
             conn.close()
 
-    def _proxy_auth_http(self) -> None:
-        """反向代理 /auth-api/* 到 control-panel (IAM)。
-
-        1. 路径改写: /auth-api/... -> /api/... (control-panel 的路由前缀是 /api)
-        2. 登录响应拦截: 从 JSON body 取 access_token/refresh_token, 写 HttpOnly cookie
-        3. 非 login 请求: control-panel 用 HTTPBearer 只认 Authorization 头,
-           故从 jw_token cookie 取 token 注入 Authorization: Bearer
-        4. 屏蔽上游 Set-Cookie (control-panel 不发, 但防御性)
-        """
-        if not self.iam_target:
-            self.send_error(503, "iam target not configured")
-            return
-        parsed = urlparse(self.iam_target)
-        if parsed.scheme == "https":
-            ssl_ctx = None if _get_ssl_verify() else _get_insecure_ssl_context()
-            conn: http.client.HTTPConnection = http.client.HTTPSConnection(
-                parsed.hostname,
-                parsed.port or self._DEFAULT_HTTPS_PORT,
-                timeout=self._HTTP_PROXY_TIMEOUT,
-                context=ssl_ctx,
-            )
-        else:
-            conn = http.client.HTTPConnection(
-                parsed.hostname,
-                parsed.port or self._DEFAULT_HTTP_PORT,
-                timeout=self._HTTP_PROXY_TIMEOUT,
-            )
-
-        # 路径改写: /auth-api/v1/auth/login -> /api/v1/auth/login
-        # 用 posixpath 库函数构造 URL 路径段 (G.FIO.05: 避免字符串拼接构造路径,
-        # 用库函数屏蔽 OS 差异; posixpath 跨平台恒为正斜杠, 适合 URL 路径)。
-        req_path = urlparse(self.path).path
-        auth_prefix_dir = posixpath.join(self._AUTH_API_PREFIX, "")  # /auth-api/
-        upstream_path = auth_prefix_dir  # 不会命中
-        if req_path.startswith(auth_prefix_dir):
-            tail = req_path[len(self._AUTH_API_PREFIX) + 1:]
-            upstream_path = posixpath.join("/api", tail)
-        if urlparse(self.path).query:
-            upstream_path += "?" + urlparse(self.path).query
-        is_login = upstream_path.rstrip("/").endswith("/api/v1/auth/login")
-        is_logout = upstream_path.rstrip("/").endswith("/api/v1/auth/logout")
-
-        try:
-            body = b""
-            if self.command not in ("GET", "HEAD"):
-                length = int(self.headers.get("Content-Length", "0") or "0")
-                body = self.rfile.read(length) if length > 0 else b""
-
-            # logout 要求 body 带 refresh_token, 但 token 在 HttpOnly cookie 里前端拿不到。
-            # 反代层从 jw_refresh cookie 取 refresh_token 注入 body, 前端只需 POST 空 body。
-            if is_logout:
-                refresh_cookie = self._get_auth_cookie(self._AUTH_REFRESH_COOKIE_NAME)
-                if refresh_cookie:
-                    try:
-                        payload = json.loads(body.decode("utf-8")) if body else {}
-                    except Exception:  # noqa: BLE001
-                        payload = {}
-                    if not payload.get("refresh_token"):
-                        payload["refresh_token"] = refresh_cookie
-                    body = json.dumps(payload).encode("utf-8")
-
-            forward_headers: dict[str, str] = {}
-            for key, value in self.headers.items():
-                kl = key.lower()
-                if kl in self._HOP_BY_HOP_HEADERS:
-                    continue
-                if kl == "host":
-                    continue
-                # 上游 Set-Cookie 由我们接管 (cookie 化), 屏蔽转发
-                if kl == "cookie":
-                    continue
-                # Content-Length 由 body 决定, 屏蔽原值避免与改写后的 body 长度冲突
-                if kl == "content-length":
-                    continue
-                forward_headers[key] = value
-            forward_headers["Host"] = parsed.netloc
-
-            # control-panel 只认 Authorization: Bearer, 不读 cookie。
-            # 非 login 请求: 从 jw_token cookie 取 token 注入头。
-            if not is_login and not any(k.lower() == "authorization" for k in forward_headers):
-                cookie_token = self._get_auth_cookie()
-                if cookie_token:
-                    forward_headers["Authorization"] = f"Bearer {cookie_token}"
-
-            # 由当前 body 长度决定 Content-Length (login 空 body / logout 注入 refresh_token 后已改写)。
-            if self.command not in ("GET", "HEAD"):
-                forward_headers["Content-Length"] = str(len(body))
-
-            conn.request(self.command, upstream_path, body=body, headers=forward_headers)
-            resp = conn.getresponse()
-            resp_body = resp.read()
-
-            self.send_response(resp.status, resp.reason)
-            # 登录成功: 拦截 body 写 cookie
-            wrote_cookies = False
-            if is_login and resp.status == 200:
-                try:
-                    payload = json.loads(resp_body.decode("utf-8"))
-                    access_token = payload.get("access_token") or (payload.get("data") or {}).get("access_token")
-                    refresh_token = payload.get("refresh_token") or (payload.get("data") or {}).get("refresh_token")
-                    if access_token:
-                        self._set_auth_cookie(access_token)
-                        wrote_cookies = True
-                    if refresh_token:
-                        self._set_auth_cookie(refresh_token, self._AUTH_REFRESH_COOKIE_NAME, self._AUTH_REFRESH_MAX_AGE)
-                        wrote_cookies = True
-                except Exception:  # noqa: BLE001
-                    pass
-            # 转发响应头, 但 Set-Cookie 由我们接管
-            for key, value in resp.getheaders():
-                kl = key.lower()
-                if kl in self._HOP_BY_HOP_HEADERS:
-                    continue
-                if kl == "set-cookie":
-                    continue  # 已由 _set_auth_cookie / _clear_auth_cookie 接管
-                self.send_header(key, value)
-            # 登出: 无论上游返回啥 (control-panel logout 可能 500), 都清 HttpOnly cookie。
-            # 前端 JS 清不掉 HttpOnly, 必须由后端发过期 Set-Cookie; 清后 reload 即回登录页。
-            if is_logout:
-                self._clear_auth_cookie()
-                self._clear_auth_cookie(self._AUTH_REFRESH_COOKIE_NAME)
-            self.end_headers()
-            if self.command != "HEAD":
-                self.wfile.write(resp_body)
-        except Exception as exc:  # noqa: BLE001
-            self.log_error("proxy auth http error: %s", exc)
-            self.send_error(502, "proxy auth http error")
-        finally:
-            conn.close()
-
     def _proxy_websocket_tunnel(self) -> None:
         parsed = urlparse(self.ws_target)
         if parsed.scheme not in ("ws", "wss", "http", "https"):
@@ -860,21 +707,15 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
             self.send_error(502, "proxy ws connect failed")
             return
 
+        # The 0.25s timeout above only paces connect retries. Keeping it for the
+        # handshake made every reconnect fail with 502 whenever the gateway loop
+        # needed more than 250ms to answer the Upgrade.
+        upstream.settimeout(self._WS_HANDSHAKE_TIMEOUT)
         try:
             if parsed.scheme in ("wss", "https"):
                 ctx = ssl.create_default_context() if _get_ssl_verify() else _get_insecure_ssl_context()
                 upstream = ctx.wrap_socket(upstream, server_hostname=upstream_host)
-            # 注入 cookie 里的 access_token 作为 ?token=, gateway 鉴权优先级最高。
-            # 浏览器 WS 无法带 Authorization 头, 故走 query 注入。
-            upstream_path = self.path
-            token = self._get_auth_cookie()
-            if token:
-                if "?" in upstream_path:
-                    base, q = upstream_path.split("?", 1)
-                    upstream_path = f"{base}?token={quote(token)}&{q}"
-                else:
-                    upstream_path = f"{upstream_path}?token={quote(token)}"
-            request_lines = [f"{self.command} {upstream_path} HTTP/1.1"]
+            request_lines = [f"{self.command} {self.path} HTTP/1.1"]
             for key, value in self.headers.items():
                 # Optional debug mode: disable websocket compression so frames stay
                 # plain text and can be parsed for req/res/event logging.
@@ -1125,10 +966,6 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
         return True
 
     def _dispatch_proxy(self) -> bool:
-        if self._is_auth_api_route():
-            # /auth-api/* 优先, 反代到 control-panel (IAM), 走 cookie 桥接
-            self._proxy_auth_http()
-            return True
         if self._is_api_route():
             self._proxy_http()
             return True
@@ -1163,6 +1000,24 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
         except ValueError:
             return False
 
+    def _resolve_project_path(self, rel_path: str) -> Path:
+        """Resolve ``rel_path`` under ``project_root``.
+
+        NUL is rejected explicitly instead of relying on ``Path.resolve()``
+        raising: only POSIX raises ``ValueError`` for an embedded NUL byte,
+        while Windows behaves differently across Python versions (3.11
+        truncates silently at the NUL, 3.13 returns the path unchanged).  Other
+        malformed inputs still surface as ``OSError`` / ``ValueError`` from
+        ``resolve()``.  Both are mapped to ``_BadRequestError`` so the request
+        is answered with ``400`` instead of crashing the handler thread.
+        """
+        if "\x00" in rel_path:
+            raise _BadRequestError("invalid_path")
+        try:
+            return (self.project_root / rel_path).resolve()
+        except (OSError, ValueError) as exc:
+            raise _BadRequestError("invalid_path") from exc
+
     def _write_json(self, status: int, payload: dict) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -1185,10 +1040,8 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
             parsed[unquote(k)] = unquote(v)
         return parsed
 
-    # --- /auth-api cookie helpers ---
-    def _get_auth_cookie(self, name: str | None = None) -> str:
-        """从 Cookie 头读取指定鉴权 cookie,默认 access token。"""
-        cookie_name = name or self._AUTH_COOKIE_NAME
+    def _get_auth_cookie(self, name: str) -> str:
+        """从 Cookie 头读取指定名称的 HttpOnly cookie (桌面锁 __wsdt 等)。"""
         raw = self.headers.get("Cookie", "")
         if not raw:
             return ""
@@ -1197,26 +1050,9 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
             if not part or "=" not in part:
                 continue
             k, v = part.split("=", 1)
-            if k.strip() == cookie_name:
+            if k.strip() == name:
                 return unquote(v)
         return ""
-
-    def _set_auth_cookie(self, token: str, name: str | None = None, max_age: int | None = None) -> None:
-        """写 HttpOnly + SameSite=Lax 的 Set-Cookie,前端 JS 读不到 token 明文。"""
-        cookie_name = name or self._AUTH_COOKIE_NAME
-        cookie_age = max_age if max_age is not None else self._AUTH_COOKIE_MAX_AGE
-        self.send_header(
-            "Set-Cookie",
-            f"{cookie_name}={quote(token, safe='')}; Path=/; HttpOnly; SameSite=Lax; Max-Age={cookie_age}",
-        )
-
-    def _clear_auth_cookie(self, name: str | None = None) -> None:
-        """发过期 Set-Cookie 清掉 HttpOnly cookie (前端 JS 清不掉 HttpOnly, 必须后端清)。"""
-        cookie_name = name or self._AUTH_COOKIE_NAME
-        self.send_header(
-            "Set-Cookie",
-            f"{cookie_name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
-        )
 
     def _resolve_session_title(self, session_dir: Path, history: list[dict[str, Any]]) -> str:
         metadata_path = session_dir / "metadata.json"
@@ -1449,7 +1285,7 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
             if not dir_arg:
                 self._write_json(400, {"error": "missing_dir"})
                 return
-            full_dir = (self.project_root / dir_arg).resolve()
+            full_dir = self._resolve_project_path(dir_arg)
             if not self._is_path_under_allowed_root(full_dir):
                 self._write_json(403, {"error": "forbidden_dir"})
                 return
@@ -1474,7 +1310,7 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
             if not dir_arg:
                 self._write_json(400, {"error": "missing_dir"})
                 return
-            full_dir = (self.project_root / dir_arg).resolve()
+            full_dir = self._resolve_project_path(dir_arg)
             if not self._is_path_under_allowed_root(full_dir):
                 self._write_json(403, {"error": "forbidden_dir"})
                 return
@@ -1503,7 +1339,7 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
             if not file_arg:
                 self._write_json(400, {"error": "missing_file_path"})
                 return
-            full_path = (self.project_root / file_arg).resolve()
+            full_path = self._resolve_project_path(file_arg)
             if not self._is_path_under_allowed_root(full_path):
                 self._write_json(403, {"error": "forbidden_path"})
                 return
@@ -1532,7 +1368,7 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
             if not file_arg:
                 self._write_json(400, {"error": "missing_file_path"})
                 return
-            full_path = (self.project_root / file_arg).resolve()
+            full_path = self._resolve_project_path(file_arg)
             if not self._is_path_under_allowed_root(full_path):
                 self._write_json(403, {"error": "forbidden_path"})
                 return
@@ -1570,6 +1406,9 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
 
             try:
                 data, used_encoding = read_file_with_encoding(full_path, encoding_arg)
+            except (LookupError, UnicodeDecodeError) as exc:
+                self._write_json(400, {"error": "invalid_encoding", "detail": str(exc)})
+                return
             except OSError as exc:
                 self._write_json(500, {"error": str(exc)})
                 return
@@ -1946,6 +1785,112 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(raw)
 
+    def _handle_skill_sync_post(self, parsed) -> None:
+        """POST /skill-sync/{diff,package,apply}：Server/Client 分离部署技能同步."""
+        try:
+            from jiuwenswarm.server.runtime.skill import skill_sync_http
+            from jiuwenswarm.server.runtime.skill.skill_manager import SkillRpcError
+        except ImportError as exc:
+            self.log_error("skill sync module unavailable: %s", exc)
+            self._write_json(
+                500,
+                {
+                    "code": "SKILL_SYNC_PACKAGE_FAILED",
+                    "message": "skill-sync 模块不可用",
+                    "error": "skill-sync 模块不可用",
+                },
+            )
+            return
+
+        authorization = self.headers.get("Authorization", "")
+        # 读 body 前完成鉴权与 Content-Length 预检（未鉴权连接不得
+        # 强制服务器读入任意大小的 body；apply 超限直接 413）
+        content_length_raw = self.headers.get("Content-Length", "")
+        try:
+            content_length = int(content_length_raw) if content_length_raw else 0
+        except ValueError:
+            # 与 skill_sync_http_error_body 一致的三字段结构（code/message/
+            # error），按 code 解析的客户端不失配
+            self._write_json(
+                400,
+                skill_sync_http.skill_sync_http_error_body(
+                    "SKILL_SYNC_INVALID_PAYLOAD", "Content-Length 不是有效整数"
+                ),
+            )
+            return
+        try:
+            skill_sync_http.precheck_skill_sync_request(
+                authorization=authorization,
+                path=parsed.path,
+                content_length=content_length,
+            )
+        except SkillRpcError as exc:
+            status = skill_sync_http.skill_sync_http_error_status(exc.code)
+            self._write_json(
+                status, skill_sync_http.skill_sync_http_error_body(exc.code, exc.message)
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            # 预检兜底：任何未预期异常（如畸形 header 触发的解析错误）
+            # 都不得冒泡到 BaseHTTPRequestHandler 打印 traceback 断连
+            self.log_error("skill-sync precheck failed: %s", exc)
+            self._write_json(
+                400,
+                skill_sync_http.skill_sync_http_error_body(
+                    "SKILL_SYNC_INVALID_PAYLOAD", "请求预检失败"
+                ),
+            )
+            return
+
+        if parsed.path == "/skill-sync/diff":
+            status, payload = skill_sync_http.handle_sync_diff_http(
+                authorization=authorization,
+                body=self._read_request_body(),
+            )
+            self._write_json(status, payload)
+            return
+
+        if parsed.path == "/skill-sync/package":
+            status, payload = skill_sync_http.handle_sync_package_http(
+                authorization=authorization,
+                body=self._read_request_body(),
+                send_file=self._send_skill_sync_zip,
+            )
+            if payload is not None:
+                self._write_json(status, payload)
+            return
+
+        if parsed.path == "/skill-sync/apply":
+            status, payload = skill_sync_http.handle_sync_apply_http(
+                authorization=authorization,
+                content_type=self.headers.get("Content-Type", ""),
+                body=self._read_request_body(),
+                content_length=content_length,
+            )
+            self._write_json(status, payload)
+            return
+
+        self._write_json(404, {"error": "not_found"})
+
+    def _send_skill_sync_zip(
+        self, zip_path: Path, filename: str, sha256: str, size: int
+    ) -> None:
+        """整包临时文件回写响应头后流式发送（X-Package-Sha256 覆盖整个 body）."""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header(
+            "Content-Disposition", f'attachment; filename="{filename}"'
+        )
+        self.send_header("X-Package-Sha256", sha256)
+        self.send_header("Content-Length", str(size))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        with zip_path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                self.wfile.write(chunk)
+
     def _handle_file_api_post(self, parsed) -> None:
         if parsed.path == "/file-api/skills/upload-temp":
             self._handle_skills_upload_temp()
@@ -1978,7 +1923,7 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
             return
 
         if parsed.path == "/file-api/file-content":
-            length = int(self.headers.get("Content-Length", "0") or "0")
+            length = self._parse_content_length()
             raw = self.rfile.read(length) if length > 0 else b""
             try:
                 payload = json.loads(raw.decode("utf-8") if raw else "{}")
@@ -1995,7 +1940,7 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
                 self._write_json(400, {"error": "missing_file_content"})
                 return
 
-            full_path = (self.project_root / request_path).resolve()
+            full_path = self._resolve_project_path(request_path)
             if not self._is_path_under_allowed_root(full_path):
                 self._write_json(403, {"error": "forbidden_path"})
                 return
@@ -2015,7 +1960,7 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
             return
 
         if parsed.path == "/file-api/ws-debug-config":
-            length = int(self.headers.get("Content-Length", "0") or "0")
+            length = self._parse_content_length()
             raw = self.rfile.read(length) if length > 0 else b""
             try:
                 payload = json.loads(raw.decode("utf-8") if raw else "{}")
@@ -2038,8 +1983,15 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
 
         self._write_json(404, {"error": "not_found"})
 
+    def _parse_content_length(self) -> int:
+        raw = self.headers.get("Content-Length", "0") or "0"
+        try:
+            return int(raw)
+        except (TypeError, ValueError) as exc:
+            raise _BadRequestError("invalid_content_length") from exc
+
     def _read_request_body(self) -> bytes:
-        length = int(self.headers.get("Content-Length", "0") or "0")
+        length = self._parse_content_length()
         return self.rfile.read(length) if length > 0 else b""
 
     def _handle_skills_upload_temp(self) -> None:
@@ -2128,10 +2080,10 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
             self._handle_share_api_get(parsed)
             return
         if self._is_file_api_route():
-            self._handle_file_api_get(parsed)
-            return
-        if self._is_web_config_route():
-            self._handle_web_config()
+            try:
+                self._handle_file_api_get(parsed)
+            except _BadRequestError as exc:
+                self._write_json(400, {"error": str(exc)})
             return
         if self._dispatch_proxy():
             return
@@ -2167,8 +2119,16 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
         if self._is_share_api_route():
             self._handle_share_api_post(parsed)
             return
+        # 技能同步接口为独立 /skill-sync/* 路径（不属 /file-api 命名空间），
+        # 必须在 do_POST 顶层接入而非 _handle_file_api_post（设计文档第 7 节）。
+        if self._is_skill_sync_route():
+            self._handle_skill_sync_post(parsed)
+            return
         if self._is_file_api_route():
-            self._handle_file_api_post(parsed)
+            try:
+                self._handle_file_api_post(parsed)
+            except _BadRequestError as exc:
+                self._write_json(400, {"error": str(exc)})
             return
         if self._dispatch_proxy():
             return
@@ -2200,7 +2160,10 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
             self._handle_share_api_get(parsed)
             return
         if self._is_file_api_route():
-            self._handle_file_api_get(parsed)
+            try:
+                self._handle_file_api_get(parsed)
+            except _BadRequestError as exc:
+                self._write_json(400, {"error": str(exc)})
             return
         if self._dispatch_proxy():
             return
@@ -2244,13 +2207,29 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
         super().end_headers()
 
     def send_head(self):
+        # 内嵌 NUL 必须在 resolve() 之前显式拦截：POSIX 上 Path.resolve() 会抛
+        # ValueError，但 Windows 上各 Python 版本行为不一致（3.11 静默在 NUL 处截断、
+        # 3.12 抛异常、3.13 原样返回含 NUL 的路径），靠捕获异常无法跨平台覆盖。
+        # 跨盘符（/D:/x）则由下面的 os.path.commonpath 抛 ValueError。两类都要转成
+        # 400：handle_one_request 只捕获 TimeoutError，异常会穿透到 socketserver，
+        # 连接被直接关掉且客户端收不到任何 HTTP 响应。
         parsed = urlparse(self.path)
         req_path = unquote(parsed.path)
-        rel_path = req_path.lstrip("/") or "index.html"
+        if "\x00" in req_path:
+            self._static_cache_control = None
+            self._write_json(400, {"error": "invalid_path"})
+            return None
 
-        base_dir = Path(self.directory or os.getcwd()).resolve()
-        target = (base_dir / rel_path).resolve()
-        in_base = os.path.commonpath([str(base_dir), str(target)]) == str(base_dir)
+        try:
+            rel_path = req_path.lstrip("/") or "index.html"
+
+            base_dir = Path(self.directory or os.getcwd()).resolve()
+            target = (base_dir / rel_path).resolve()
+            in_base = os.path.commonpath([str(base_dir), str(target)]) == str(base_dir)
+        except (OSError, ValueError):
+            self._static_cache_control = None
+            self._write_json(400, {"error": "invalid_path"})
+            return None
 
         # 使用实际静态解析结果判定 SPA 入口, 覆盖 /、index.html 及路由回退。
         # 现存静态资源及其他 HTML 产物不需要桌面 Cookie。
@@ -2271,8 +2250,6 @@ class _SpaStaticHandler(SimpleHTTPRequestHandler):
 
 
 def _normalize_api_target(value: str) -> str:
-    if not value:
-        return ""
     parsed = urlparse(value)
     if parsed.scheme not in ("http", "https"):
         raise ValueError(f"api target must be http/https: {value}")
@@ -2373,8 +2350,6 @@ def main() -> None:
     default_port = int(os.getenv("FRONTEND_PORT", "5173"))
     web_port = os.getenv("WEB_PORT", "19000")  # WebChannel websocket port (proxy target)
     default_proxy = os.getenv("GATEWAY_URL", f"http://127.0.0.1:{web_port}")
-    # control-panel (IAM) 默认地址; 部署脚本经 IAM_AUTH_SERVICE_URL 注入, 否则留空(无鉴权, 直接进入主页面)
-    default_iam = os.getenv("IAM_AUTH_SERVICE_URL", "")
 
     parser = argparse.ArgumentParser(description="Serve JiuwenSwarm frontend static files.")
     parser.add_argument("--host", default=default_host, help="Host to bind.")
@@ -2398,16 +2373,6 @@ def main() -> None:
         "--ws-target",
         default="",
         help="Override backend target for /ws (ws/wss/http/https).",
-    )
-    parser.add_argument(
-        "--iam-target",
-        default=default_iam,
-        help="control-panel (IAM) base URL for /auth-api/*, e.g. http://127.0.0.1:8090.",
-    )
-    parser.add_argument(
-        "--remote",
-        action="store_true",
-        help="All-in-one (yitiji) mode flag. Enables frontend logout button. Default off.",
     )
     parser.add_argument(
         "--log-level",
@@ -2448,8 +2413,6 @@ def main() -> None:
         proxy_target = args.proxy_target.strip()
         api_target = _normalize_api_target(args.api_target.strip() or proxy_target)
         ws_target = _normalize_ws_target(args.ws_target.strip() or proxy_target)
-        iam_target = _normalize_api_target(args.iam_target.strip() or default_iam)
-        remote_mode = bool(args.remote)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
@@ -2467,8 +2430,6 @@ def main() -> None:
 
     _ConfiguredHandler.api_target = api_target
     _ConfiguredHandler.ws_target = ws_target
-    _ConfiguredHandler.iam_target = iam_target
-    _ConfiguredHandler.remote_mode = remote_mode
     _ConfiguredHandler.ws_disable_compress = args.ws_disable_compress
     # 桌面锁定: 桌面端经 JIUWENSWARM_DESKTOP_TOKEN env 注入一次性 token;
     # 源码 web 模式为空 = 不启用, 浏览器访问行为与之前完全一致。
@@ -2510,8 +2471,6 @@ def main() -> None:
         logger.info("[jiuwenswarm-web] http://%s:%s", args.host, args.port)
         logger.info("[jiuwenswarm-web] /api -> %s", api_target)
         logger.info("[jiuwenswarm-web] /ws  -> %s", ws_target)
-        logger.info("[jiuwenswarm-web] /auth-api -> %s", iam_target)
-        logger.info("[jiuwenswarm-web] all-in-one (remote) mode: %s", remote_mode)
         logger.info("[jiuwenswarm-web] ws disable compress: %s", args.ws_disable_compress)
         logger.info(
             "[jiuwenswarm-web] desktop lock: %s",

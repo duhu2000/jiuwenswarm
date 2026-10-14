@@ -82,13 +82,15 @@ class FileCronJobStore:
     async def get_revision(self) -> int:
         return self._file_revision()
 
-    async def list_jobs(self) -> list[CronJob]:
+    async def list_jobs(self, *, strict: bool = False) -> list[CronJob]:
         # 惰性迁移:在同一个锁内 read + 推断缺 work_mode 的老 job + writeback,
         # 替代启动迁移 ``migrate_legacy_jobs_at_startup``。
         def _body() -> list[CronJob]:
-            data = self._read_json_unlocked()
-            jobs_raw = data.get("jobs") or []
+            data = self._read_json_unlocked(strict=strict)
+            jobs_raw = data.get("jobs", [])
             if not isinstance(jobs_raw, list):
+                if strict:
+                    raise ValueError("cron jobs must be an array")
                 return []
 
             jobs_raw, changed = migrate_work_mode_on_items(jobs_raw)
@@ -100,6 +102,8 @@ class FileCronJobStore:
                     logger.warning(
                         "Cron 惰性迁移写回 cron_jobs.json 失败: %s", exc
                     )
+            if strict:
+                return [CronJob.from_dict(item) for item in jobs_raw]
             return parse_cron_jobs(jobs_raw)
 
         return await self._run_locked(_body)
@@ -131,10 +135,12 @@ class FileCronJobStore:
         timeout_seconds: int | None = None,
         project_id: str = "",
         model_name: str | None = None,
+        model_selection: dict[str, str] | None = None,
         mcp: list[str] | None = None,
         app_id: str = "",
         work_mode: str = DEFAULT_WEB_WORK_MODE,
         user_id: str = "",
+        credential_ref: str = "",
     ) -> CronJob:
         """Construct and validate a ``CronJob`` without persisting it.
 
@@ -158,10 +164,12 @@ class FileCronJobStore:
             timeout_seconds=timeout_seconds,
             project_id=project_id,
             model_name=model_name,
+            model_selection=model_selection,
             mcp=mcp,
             app_id=app_id,
             work_mode=work_mode,
             user_id=user_id,
+            credential_ref=credential_ref,
         )
 
     async def create_job(
@@ -182,10 +190,12 @@ class FileCronJobStore:
         timeout_seconds: int | None = None,
         project_id: str = "",
         model_name: str | None = None,
+        model_selection: dict[str, str] | None = None,
         mcp: list[str] | None = None,
         app_id: str = "",
         work_mode: str = DEFAULT_WEB_WORK_MODE,
         user_id: str = "",
+        credential_ref: str = "",
     ) -> CronJob:
         job = self.build_job(
             job_id=job_id,
@@ -203,10 +213,12 @@ class FileCronJobStore:
             timeout_seconds=timeout_seconds,
             project_id=project_id,
             model_name=model_name,
+            model_selection=model_selection,
             mcp=mcp,
             app_id=app_id,
             work_mode=work_mode,
             user_id=user_id,
+            credential_ref=credential_ref,
         )
         await self._upsert_job(job)
         return job
@@ -290,7 +302,7 @@ class FileCronJobStore:
     async def _read_json(self) -> dict[str, Any]:
         return await self._run_locked(self._read_json_unlocked)
 
-    def _read_json_unlocked(self) -> dict[str, Any]:
+    def _read_json_unlocked(self, *, strict: bool = False) -> dict[str, Any]:
         path = self._path
         try:
             if not path.exists():
@@ -298,6 +310,8 @@ class FileCronJobStore:
             raw = path.read_text(encoding="utf-8")
             data = json.loads(raw) if raw.strip() else {}
             if not isinstance(data, dict):
+                if strict:
+                    raise ValueError("cron store must be an object")
                 return {"version": 1, "jobs": []}
             if "version" not in data:
                 data["version"] = 1
@@ -305,6 +319,8 @@ class FileCronJobStore:
                 data["jobs"] = []
             return data
         except Exception:
+            if strict:
+                raise
             return {"version": 1, "jobs": []}
 
     def _write_json_unlocked(self, data: dict[str, Any]) -> None:

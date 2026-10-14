@@ -33,14 +33,18 @@ from typing import Any
 
 from openjiuwen.core.foundation.llm import ProviderType
 
-from jiuwenswarm.agents.harness.common.rails.permissions.auto_config import (
-    is_auto_permission_mode,
-)
+from jiuwenswarm.common.permission_mode import is_auto_permission_mode
 from jiuwenswarm.common.config import (
     DEFAULT_SWARMFLOW_ENABLED,
+    DEFAULT_SWARMFLOW_WORKTREE_ENABLED,
+    DEFAULT_TEAM_DISPATCH_MODE,
+    DEFAULT_TEAM_TASK_VERIFICATION_ENABLED,
     EXTERNAL_CLI_AGENTS_CONFIG_PATH,
     SWARMFLOW_BUDGET_CONFIG_PATH,
     SWARMFLOW_ENABLED_CONFIG_PATH,
+    SWARMFLOW_WORKTREE_CONFIG_PATH,
+    TEAM_DISPATCH_MODE_CONFIG_PATH,
+    TEAM_TASK_VERIFICATION_CONFIG_PATH,
     get_config,
     get_config_raw,
     replace_teams_in_config,
@@ -57,12 +61,16 @@ from jiuwenswarm.common.config import (
     update_rsi_enabled_in_config,
     update_setup_guide_enabled_in_config,
     update_skill_evolution_enabled_in_config,
+    update_ttse_enabled_in_config,
     update_skill_retrieval_in_config,
     update_swarmflow_budget_in_config,
     update_swarmflow_enabled_in_config,
     update_symphony_in_config,
     update_task_full_duplex_in_config,
+    update_team_organization_ui_in_config,
     update_task_asr_in_config,
+    update_team_scheduled_dispatch_in_config,
+    update_team_task_verification_in_config,
     update_trajectory_ui_in_config,
     update_default_models_in_config,
     update_login_model_settings_in_config,
@@ -90,6 +98,12 @@ from jiuwenswarm.server.runtime.a2ui.integration import (
     get_default_a2ui_config_payload,
     validate_a2ui_config_update,
 )
+from jiuwenswarm.symphony.config import (
+    DEFAULT_EVOLUTION_ENABLED,
+    DEFAULT_SYMPHONY_ENABLED,
+    resolve_symphony_enabled,
+    resolve_symphony_evolution_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +116,8 @@ class ConfigPanelInternalError(RuntimeError):
 # 热更新 scope 常量与变更集（自 app_web_handlers 迁出）
 # --------------------------------------------------------------------------- #
 WEB_CONFIG_RELOAD_CHANNEL_ID = "web"
+# Saved through config.save_all but never sent back to clients.
+WRITE_ONLY_CONFIG_KEYS = frozenset({"jev_openrouter_api_key", "jev_typesafe_api_key"})
 SEARCH_RELOAD_ENV_KEYS = {
     "BOCHA_API_KEY", "PERPLEXITY_API_KEY", "SERPER_API_KEY", "JINA_API_KEY",
 }
@@ -184,7 +200,7 @@ class ConfigChangeSet:
             key_text = str(key)
             if key_text in {"models.defaults"} or key_text.startswith("models."):
                 scopes.add("model")
-            elif key_text in {"modes.team", "agents", "team"}:
+            elif key_text in {"modes.team", "agents", "team", *TEAM_DISPATCH_CONFIG_KEYS}:
                 scopes.add("team")
             elif key_text.startswith("permissions"):
                 scopes.add("permissions")
@@ -194,7 +210,7 @@ class ConfigChangeSet:
                 scopes.add("agent_runtime")
             elif key_text == "trajectory_ui_enabled":
                 scopes.update({"agent_runtime", "web_ui"})
-            elif key_text == "task_full_duplex_enabled":
+            elif key_text in {"task_full_duplex_enabled", "team_organization_ui_enabled"}:
                 scopes.add("web_ui")
             elif key_text.startswith("a2ui_") or key_text == "setup_guide_enabled":
                 scopes.add("web_ui")
@@ -298,6 +314,8 @@ CONFIG_SET_ENV_MAP = {
     "bocha_api_key": "BOCHA_API_KEY",
     "serper_api_key": "SERPER_API_KEY",
     "perplexity_api_key": "PERPLEXITY_API_KEY",
+    "jev_openrouter_api_key": "OPENROUTER_API_KEY",
+    "jev_typesafe_api_key": "TYPESAFE_API_KEY",
     "github_token": "GITHUB_TOKEN",
     "teamskills_market_url": "TEAM_SKILLS_HUB_BASE_URL",
     "teamskills_user_token": "TEAM_SKILLS_HUB_USER_TOKEN",
@@ -340,12 +358,15 @@ CONFIG_YAML_KEYS = frozenset({
     "rsi_enabled",
     "trajectory_ui_enabled",
     "task_full_duplex_enabled",
+    "team_organization_ui_enabled",
     "task_asr_enabled",
     "proactive_recommendation_enabled",
     "proactive_recommendation_max_recommend_per_day",
     "proactive_recommendation_max_rounds_per_tick",
     "swarmflow_enabled",
     "swarmflow_budget",
+    "team_scheduled_dispatch_enabled",
+    "team_task_verification_enabled",
     "external_cli_agent_claude_enabled",
     "external_cli_agent_claude_use_builtin",
     "external_cli_agent_claude_cli_path",
@@ -354,7 +375,13 @@ CONFIG_YAML_KEYS = frozenset({
     "external_cli_agent_codex_cli_path",
     "setup_guide_enabled",
     "skill_evolution",
+    "ttse_enabled",
     "enable_free_models",
+})
+# 调度模式开关（modes.team.jiuwen_team.dispatch_mode / enable_task_verification），改动后需重载 team。
+TEAM_DISPATCH_CONFIG_KEYS = frozenset({
+    "team_scheduled_dispatch_enabled",
+    "team_task_verification_enabled",
 })
 EXTERNAL_CLI_AGENT_CONFIG_KEYS = frozenset({
     "external_cli_agent_claude_enabled",
@@ -369,7 +396,7 @@ DEFAULT_EXTERNAL_CLI_PUBLISH_HOST = "127.0.0.1"
 DEFAULT_EXTERNAL_CLI_PUBLISH_PORT = "19000"
 EXTERNAL_CLI_PUBLISH_PATH = "/ws"
 UNSUPPORTED_WINDOWS_CLI_SUFFIXES = {".bat", ".cmd", ".ps1"}
-PERMISSIONS_PROFILES = frozenset({"default", "full_access"})
+PERMISSIONS_PROFILES = frozenset({"default", "automatic", "full_access"})
 
 
 def permission_profile(permission_config: object) -> str:
@@ -386,8 +413,12 @@ def canonical_permission_facade(profile: str) -> dict[str, str]:
 
 
 SYMPHONY_CONFIG_SPECS: dict[str, tuple[tuple[str, ...], str, Any]] = {
-    "symphony_enabled": (("enabled",), "bool", False),
-    "symphony_evolution_enabled": (("evolution", "enabled"), "bool", False),
+    "symphony_enabled": (("enabled",), "bool", DEFAULT_SYMPHONY_ENABLED),
+    "symphony_evolution_enabled": (
+        ("evolution", "flow", "enabled"),
+        "bool",
+        DEFAULT_EVOLUTION_ENABLED,
+    ),
 }
 SYMPHONY_CONFIG_KEYS = tuple(SYMPHONY_CONFIG_SPECS.keys())
 SKILL_RETRIEVAL_CONFIG_SPECS: dict[str, tuple[tuple[str, ...], str, Any]] = {
@@ -483,7 +514,20 @@ def flatten_symphony_for_config_panel(raw: dict[str, Any]) -> dict[str, str]:
     flat: dict[str, str] = {}
     for key, (path, value_type, default) in SYMPHONY_CONFIG_SPECS.items():
         value = get_nested_config_value(symphony, path, default)
+        if key == "symphony_evolution_enabled":
+            # null 或缺失时回退旧配置；明确写 false 时保持关闭。
+            flow = get_nested_config_value(symphony, ("evolution", "flow"), {})
+            legacy = get_nested_config_value(symphony, ("evolution", "enabled"), None)
+            if (
+                (not isinstance(flow, dict) or flow.get("enabled") is None)
+                and legacy is not None
+            ):
+                value = legacy
         if value_type == "bool":
+            if key == "symphony_enabled":
+                value = resolve_symphony_enabled(value)
+            elif key == "symphony_evolution_enabled":
+                value = resolve_symphony_evolution_enabled(value)
             flat[key] = "true" if bool(value) else "false"
         else:
             flat[key] = str(value)
@@ -514,7 +558,26 @@ def flatten_swarmflow_for_config_panel(raw: dict[str, Any]) -> dict[str, str]:
     flat = {"swarmflow_enabled": "true" if enabled else "false"}
     if budget is not None:
         flat["swarmflow_budget"] = str(budget)
+    worktree_enabled = get_nested_config_value(
+        raw,
+        SWARMFLOW_WORKTREE_CONFIG_PATH,
+        DEFAULT_SWARMFLOW_WORKTREE_ENABLED,
+    )
+    flat["swarmflow_worktree"] = "true" if worktree_enabled else "false"
     return flat
+
+
+def flatten_team_dispatch_for_config_panel(raw: dict[str, Any]) -> dict[str, str]:
+    dispatch_mode = get_nested_config_value(raw, TEAM_DISPATCH_MODE_CONFIG_PATH, DEFAULT_TEAM_DISPATCH_MODE)
+    verification = get_nested_config_value(
+        raw,
+        TEAM_TASK_VERIFICATION_CONFIG_PATH,
+        DEFAULT_TEAM_TASK_VERIFICATION_ENABLED,
+    )
+    return {
+        "team_scheduled_dispatch_enabled": "true" if str(dispatch_mode).strip() == "scheduled" else "false",
+        "team_task_verification_enabled": "true" if parse_config_switch_bool(verification) else "false",
+    }
 
 
 def flatten_external_cli_agents_for_config_panel(raw: dict[str, Any]) -> dict[str, str]:
@@ -932,6 +995,24 @@ def external_cli_agents_from_switches(raw: dict[str, Any], params: dict[str, Any
     return agents
 
 
+def refresh_external_cli_builtin_models(external_cli_agents: list[dict[str, str]]) -> None:
+    """Check the configured built-in model catalogs against the enabled CLIs.
+
+    Runs after the dependency check, so the SDK of every enabled kind is
+    installed and its cli_path resolved. A catalog naming a model the CLI
+    does not offer would only fail later, when the leader picks it, so the
+    facts are corrected here. Failure never blocks the switch.
+    """
+    if not external_cli_agents:
+        return
+    try:
+        from jiuwenswarm.common.external_cli_catalog import refresh_external_cli_builtin_models as _refresh
+
+        _refresh()
+    except Exception as exc:  # noqa: BLE001 - a health check must not fail the switch
+        logger.warning("[config.set] external CLI builtin model check failed: %s", exc)
+
+
 def build_external_cli_publish_url() -> str:
     host = str(os.getenv("WEB_HOST") or DEFAULT_EXTERNAL_CLI_PUBLISH_HOST).strip()
     if host in {"", "0.0.0.0", "::", "[::]"}:
@@ -1048,7 +1129,7 @@ def preserve_deleted_team_entities(params: dict[str, Any]) -> None:
     if next_template_ids is None:
         return
 
-    from jiuwenswarm.agents.harness.team import list_team_template_summaries
+    from jiuwenswarm.common.team_template_config import list_team_template_summaries
     from jiuwenswarm.server.runtime.team_binding_store import get_team_binding_store
     from jiuwenswarm.server.runtime.team_entity_store import ensure_team_entity_for_binding
 
@@ -1190,6 +1271,19 @@ def apply_config_payload(
                 update_swarmflow_enabled_in_config(parsed)
             elif param_key == "swarmflow_budget":
                 update_swarmflow_budget_in_config(str(val).strip())
+            elif param_key == "team_scheduled_dispatch_enabled":
+                update_team_scheduled_dispatch_in_config(parsed)
+                if not parsed:
+                    # 验证者只在调度模式下生效，关闭调度模式时一并关闭。
+                    update_team_task_verification_in_config(False)
+                    yaml_updated.append("team_task_verification_enabled")
+            elif param_key == "team_task_verification_enabled":
+                scheduled = (
+                    parse_config_bool(params["team_scheduled_dispatch_enabled"])
+                    if "team_scheduled_dispatch_enabled" in params
+                    else flatten_team_dispatch_for_config_panel(raw)["team_scheduled_dispatch_enabled"] == "true"
+                )
+                update_team_task_verification_in_config(parsed and scheduled)
             elif param_key in EXTERNAL_CLI_AGENT_CONFIG_KEYS:
                 if not external_cli_agents_updated:
                     try:
@@ -1218,9 +1312,12 @@ def apply_config_payload(
                         external_cli_agents,
                         build_external_cli_publish_url(),
                     )
+                    refresh_external_cli_builtin_models(external_cli_agents)
                     external_cli_agents_updated = True
             elif param_key == "skill_evolution":
                 update_skill_evolution_enabled_in_config(parsed)
+            elif param_key == "ttse_enabled":
+                update_ttse_enabled_in_config(parsed)
             elif param_key.startswith("a2ui_"):
                 ok, update, error = validate_a2ui_config_update(param_key, val)
                 if not ok:
@@ -1230,6 +1327,8 @@ def apply_config_payload(
                 update_trajectory_ui_in_config(parsed)
             elif param_key == "task_full_duplex_enabled":
                 update_task_full_duplex_in_config(parsed)
+            elif param_key == "team_organization_ui_enabled":
+                update_team_organization_ui_in_config(parsed)
             elif param_key == "task_asr_enabled":
                 update_task_asr_in_config(parsed)
             elif param_key == "proactive_recommendation_enabled":
@@ -1384,7 +1483,7 @@ async def config_get_handler(
 ) -> None:
     """返回 CONFIG_SET_ENV_MAP 里所有键对应的环境变量当前值（Web 契约）。"""
     payload = {
-        param_key: (os.getenv(env_key) or "")
+        param_key: "" if param_key in WRITE_ONLY_CONFIG_KEYS else (os.getenv(env_key) or "")
         for param_key, env_key in CONFIG_SET_ENV_MAP.items()
     }
     payload["app_version"] = __version__
@@ -1416,6 +1515,8 @@ async def config_get_handler(
         # Skill evolution is controlled solely by the canonical nested YAML key.
         evolution_cfg = (raw.get("react") or {}).get("evolution") or {}
         payload["skill_evolution"] = "true" if evolution_cfg.get("skill_evolution", False) else "false"
+        ttse_cfg = (raw.get("react") or {}).get("ttse") or {}
+        payload["ttse_enabled"] = "true" if ttse_cfg.get("enabled", False) else "false"
         memory_cfg = (raw.get("memory") or {}).get("forbidden_memory_definition") or {}
         payload["memory_forbidden_enabled"] = "true" if memory_cfg.get("enabled", False) else "false"
         memory_desc = memory_cfg.get("description") or {}
@@ -1426,6 +1527,9 @@ async def config_get_handler(
             "true" if trajectory_cfg.get("enabled", False) else "false"
         )
         experimental_cfg = raw.get("experimental") or {}
+        payload["team_organization_ui_enabled"] = (
+            "true" if experimental_cfg.get("team_organization_ui_enabled", False) else "false"
+        )
         payload["task_full_duplex_enabled"] = (
             "true" if experimental_cfg.get("task_full_duplex_enabled", False) else "false"
         )
@@ -1433,6 +1537,7 @@ async def config_get_handler(
             "true" if experimental_cfg.get("task_asr_enabled", False) else "false"
         )
         payload.update(flatten_swarmflow_for_config_panel(raw))
+        payload.update(flatten_team_dispatch_for_config_panel(raw))
         payload.update(flatten_external_cli_agents_for_config_panel(raw))
         payload.update(flatten_symphony_for_config_panel(raw))
         if not payload.get("free_search_ddg_enabled"):
@@ -1458,13 +1563,20 @@ async def config_get_handler(
         payload.setdefault("permissions_profile", "full_access")
         payload.setdefault("setup_guide_enabled", "true")
         payload.setdefault("skill_evolution", "false")
+        payload.setdefault("ttse_enabled", "false")
         payload.setdefault("memory_forbidden_enabled", "false")
         payload.setdefault("memory_forbidden_description", "")
         payload.setdefault("swarmflow_enabled", "true" if DEFAULT_SWARMFLOW_ENABLED else "false")
+        payload.setdefault("team_scheduled_dispatch_enabled", "false")
+        payload.setdefault(
+            "team_task_verification_enabled",
+            "true" if DEFAULT_TEAM_TASK_VERIFICATION_ENABLED else "false",
+        )
         for key, value in get_default_a2ui_config_payload().items():
             payload.setdefault(key, value)
         payload.setdefault("trajectory_ui_enabled", "false")
         payload.setdefault("task_full_duplex_enabled", "false")
+        payload.setdefault("team_organization_ui_enabled", "false")
         payload.setdefault("task_asr_enabled", "false")
         for key, (_, value_type, default) in {
             **SYMPHONY_CONFIG_SPECS,
@@ -1495,6 +1607,7 @@ async def config_set_handler(
     agent_client: Any = None,
     ensure_codex_dependency: Any = None,
     ensure_claude_dependency: Any = None,
+    on_free_models_toggled: Any = None,
 ) -> None:
     """根据前端消息内容更新配置（支持 .env 与 config.yaml 中的键），并写回对应文件。"""
     if not isinstance(params, dict):
@@ -1526,12 +1639,11 @@ async def config_set_handler(
         logger.warning("[config.set] on_config_saved failed: %s", exc)
         applied_without_restart = False
 
-    if "enable_free_models" in apply_result.yaml_updated:
+    if "enable_free_models" in apply_result.yaml_updated and on_free_models_toggled is not None:
         try:
-            from jiuwenswarm.server.runtime.opencode_zen import warm_zen_free_models
-            await warm_zen_free_models(reason="config-toggle")
+            await on_free_models_toggled()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("[config.set] warm_zen_free_models failed: %s", exc)
+            logger.warning("[config.set] zen free-model warmup failed: %s", exc)
 
     updated_param_keys = [k for k, e in CONFIG_SET_ENV_MAP.items() if e in env_updates] + yaml_updated
     payload = {"updated": updated_param_keys, "applied_without_restart": applied_without_restart}
@@ -1577,6 +1689,7 @@ async def config_save_all_handler(
     agent_client: Any = None,
     ensure_codex_dependency: Any = None,
     ensure_claude_dependency: Any = None,
+    on_free_models_toggled: Any = None,
 ) -> None:
     """Batch-save config panel changes and trigger a single hot reload.
 
@@ -1675,12 +1788,11 @@ async def config_save_all_handler(
             agent_client=agent_client,
         )
 
-        if "enable_free_models" in yaml_updated:
+        if "enable_free_models" in yaml_updated and on_free_models_toggled is not None:
             try:
-                from jiuwenswarm.server.runtime.opencode_zen import warm_zen_free_models
-                await warm_zen_free_models(reason="config-toggle")
+                await on_free_models_toggled()
             except Exception as exc:  # noqa: BLE001
-                logger.warning("[config.save_all] warm_zen_free_models failed: %s", exc)
+                logger.warning("[config.save_all] zen free-model warmup failed: %s", exc)
 
         payload = {
             "updated": [k for k, e in CONFIG_SET_ENV_MAP.items() if e in env_updates] + yaml_updated,

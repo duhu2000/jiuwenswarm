@@ -13,6 +13,10 @@ export * from './contextUsage';
 export * from '../features/workspace/projectTypes';
 
 // 会话类型
+/** Stable selection DTO used by session/cron/runtime APIs. */
+export type ModelSelection =
+  { type: 'model'; id: string; route_id?: never } | { type: 'model_group'; id: string; route_id?: string | null };
+
 export interface Session {
   session_id: string;
   title: string;
@@ -29,11 +33,9 @@ export interface Session {
   title_source?: 'auto' | 'user';
   /** Direct parent session when this conversation was created by fork. */
   forked_from?: string;
-  /** Temporary side conversations are omitted from the normal session list. */
-  ephemeral?: boolean;
-  /** Direct parent for an ephemeral side conversation. */
-  side_parent_session_id?: string;
   model?: string;
+  /** Stable selection persisted via session.selection.set / metadata. */
+  model_selection?: ModelSelection | null;
   mode: AgentMode;
   status: SessionStatus;
   message_count: number;
@@ -41,6 +43,14 @@ export interface Session {
   updated_at: string;
   is_active?: boolean;
   is_processing?: boolean;
+  queued_session_messages?: Array<{
+    message_id: string;
+    target_session_id: string;
+    source_session_id: string;
+    source_title: string;
+    content: string;
+    status: string;
+  }>;
   current_task?: string;
   tools?: string[];
   team_name?: string;
@@ -49,11 +59,11 @@ export interface Session {
   /** 首次 AgentGroup 绑定时锁定的 leader 身份；旧 session 可能没有该字段。 */
   team_leader_identity?: unknown;
   // ---- session.list 扩展字段 ----
-  channel_id?: string;         // 渠道ID
-  user_id?: string;            // 创建人ID
-  last_message_at?: number;    // 最近对话时间(Unix时间戳)
+  channel_id?: string; // 渠道ID
+  user_id?: string; // 创建人ID
+  last_message_at?: number; // 最近对话时间(Unix时间戳)
   last_user_message_at?: number; // 最后一条用户消息时间(Unix时间戳)
-  cron_id?: string;            // 定时任务ID；非空表示 cron 触发的会话，侧栏仅归属定时任务分组
+  cron_id?: string; // 定时任务ID；非空表示 cron 触发的会话，侧栏仅归属定时任务分组
   /** 后端保存的会话级装备快照，用于刷新页面后恢复插件/MCP选择。 */
   session_equipment?: {
     agent_template_name?: string;
@@ -102,9 +112,13 @@ export type ModelReasoningCatalog = {
 };
 
 export interface ModelEntry {
+  /** Backend stable model ID. Zen free models may omit this field. */
+  model_id?: string;
   model_name: string;
   api_base: string;
   api_key: string;
+  /** The backend has a stored credential but intentionally does not return it. */
+  has_api_key?: boolean;
   model_provider: string;
   timeout?: number;
   temperature?: number;
@@ -137,6 +151,30 @@ export interface ModelEntry {
   /** 登录来源的模型是只读的：改了也不会写进 config.yaml（服务端会过滤）。 */
   read_only?: boolean;
 }
+
+export type ModelRoute = {
+  route_id?: string;
+  model_id: string;
+  enabled?: boolean;
+  request_overrides?: Record<string, unknown>;
+  tpm?: number;
+  rpm?: number;
+  timeout?: number;
+};
+
+export type ModelGroup = {
+  model_group_id?: string;
+  display_name?: string | null;
+  enabled?: boolean | null;
+  is_default?: boolean | null;
+  routes: ModelRoute[];
+  request_config?: Record<string, unknown> | null;
+};
+
+export type ModelSelectionReference = {
+  scope: string;
+  scope_id?: string;
+};
 
 export interface VendorPreset {
   vendor_key: string;

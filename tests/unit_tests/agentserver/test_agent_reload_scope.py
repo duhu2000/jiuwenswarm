@@ -585,6 +585,55 @@ async def test_agent_reload_config_handler_passes_explicit_scope(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_agent_reload_config_preserves_agent_owned_a4p_config(monkeypatch):
+    from jiuwenswarm.agents.harness.common import a4p_runtime
+
+    server = agent_ws_server_module.AgentWebSocketServer()
+    order = []
+
+    reconfigure = AsyncMock()
+    monkeypatch.setattr(a4p_runtime, "get_a4p_config", lambda: {"enabled": True})
+
+    async def fake_reload(config, env, **kwargs):
+        assert config == {"a4p": {"enabled": True}}
+        order.append("reload")
+
+    monkeypatch.setattr(
+        a4p_runtime,
+        "reconfigure_a4p_runtime",
+        reconfigure,
+    )
+    monkeypatch.setattr(server._agent_manager, "reload_agents_config", fake_reload)
+    monkeypatch.setattr(
+        agent_ws_server_module,
+        "encode_agent_response_for_wire",
+        lambda resp, response_id: {
+            "response_id": response_id,
+            "ok": resp.ok,
+            "payload": resp.payload,
+        },
+    )
+
+    request = AgentRequest(
+        request_id="reload-disable-a4p",
+        channel_id="web",
+        req_method=ReqMethod.AGENT_RELOAD_CONFIG,
+        params={
+            "config": {"a4p": {"enabled": False}},
+            "env": {},
+        },
+    )
+
+    ws = FakeWebSocket()
+    await server._handle_agent_reload_config(ws, request, asyncio.Lock())
+
+    assert order == ["reload"]
+    reconfigure.assert_not_awaited()
+    assert request.params["config"] == {"a4p": {"enabled": False}}
+    assert json.loads(ws.sent[-1])["ok"] is True
+
+
+@pytest.mark.asyncio
 async def test_agent_reload_config_handler_skips_agent_manager_for_web_ui_scope(monkeypatch):
     from jiuwenswarm.agents.harness import team as team_harness_module
 
@@ -1061,6 +1110,63 @@ def test_deep_adapter_resolve_model_for_request_falls_back_to_session_metadata()
         resolved = adapter._resolve_model_for_request(request)
 
     assert resolved is session_model
+
+
+def test_deep_adapter_persisted_selection_overrides_last_resolved_model():
+    from jiuwenswarm.common.model_selection import ModelSelection
+    from jiuwenswarm.server.runtime.agent_adapter.interface_deep import (
+        AgentRequest,
+        JiuWenSwarmDeepAdapter,
+    )
+
+    adapter = JiuWenSwarmDeepAdapter()
+    adapter._last_resolved_model = object()
+    request = AgentRequest(
+        request_id="req-switch",
+        channel_id="test",
+        session_id="sid-switch",
+        params={},
+    )
+
+    with patch(
+        "jiuwenswarm.server.runtime.session.model_selection_store.get_session_model_selection",
+        return_value=ModelSelection(type="model_group", id="mgp_new"),
+    ):
+        requested = adapter._requested_model_name(request)
+
+    assert requested == "model_group:mgp_new"
+
+
+def test_deep_adapter_passes_request_to_model_access_checker(monkeypatch):
+    from jiuwenswarm.common.model_errors import MODEL_SELECTION_FORBIDDEN, ModelSelectionError
+    from jiuwenswarm.server.runtime.agent_adapter.interface_deep import (
+        AgentRequest,
+        JiuWenSwarmDeepAdapter,
+    )
+    from jiuwenswarm.server.runtime import model_routing_registry
+
+    request = AgentRequest(
+        request_id="req-forbidden",
+        channel_id="web",
+        params={"model_selection": {"type": "model", "id": "mdl_private"}},
+    )
+    adapter = JiuWenSwarmDeepAdapter()
+    adapter._model_selection_can_access = lambda seen, kind, resource_id: (
+        seen is request and kind == "model" and resource_id != "mdl_private"
+    )
+
+    class FakeResolver:
+        def resolve(self, selection, context):
+            if context.can_access and not context.can_access(selection.type, selection.id):
+                raise ModelSelectionError(MODEL_SELECTION_FORBIDDEN, "forbidden")
+            raise AssertionError("access checker unexpectedly allowed the model")
+
+    monkeypatch.setattr(model_routing_registry, "ModelSelectionResolver", FakeResolver)
+
+    with pytest.raises(ModelSelectionError) as caught:
+        adapter._resolve_model_for_request(request)
+
+    assert caught.value.code == MODEL_SELECTION_FORBIDDEN
 
 
 def test_deep_adapter_apply_model_updates_deep_config_for_goal_assessor():

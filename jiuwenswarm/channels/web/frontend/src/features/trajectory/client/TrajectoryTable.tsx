@@ -1,5 +1,3 @@
-// Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-
 /**
  * Turn-aware trajectory event ledger with a local record inspector.
  * Adapted mechanically from `packages/client/ui-trajectory/src/client/TrajectoryTable.tsx`
@@ -23,7 +21,7 @@ import type {
   AssistantMetricDetail, TrajectoryCellKind, TrajectoryCellProps, TrajectorySourceBlock,
 } from '../trajectory/record.ts'
 import {
-  formatElapsedSeconds, formatTokenCount, liveElapsedSeconds, trajectoryRecordId,
+  formatDurationMillis, formatElapsedSeconds, formatTokenCount, liveElapsedSeconds, trajectoryRecordId,
 } from '../trajectory/record.ts'
 import type {
   TrajectoryPromptSnapshot,
@@ -37,7 +35,11 @@ import {
   groupTrajectoryVirtualRows, trajectoryVirtualRecordKey,
 } from '../trajectory/virtual-rows.ts'
 import type { TrajectoryVirtualRow } from '../trajectory/virtual-rows.ts'
-import { trajectoryDisplayText, trajectoryPreviewText } from '../trajectory/preview.ts'
+import { isThinkingOnlyPreview, trajectoryDisplayText, trajectoryPreviewText } from '../trajectory/preview.ts'
+import {
+  compactionExplanation, compactionFacts, compactionsByToolCall,
+} from '../trajectory/compaction.ts'
+import type { CompactionFacts, CompactionModifiedMessage } from '../trajectory/compaction.ts'
 import css from './TrajectoryTable.module.css'
 
 const BOTTOM_FOLLOW_THRESHOLD_PX = 2
@@ -321,6 +323,11 @@ function ttft(metrics: AssistantMetricDetail): string {
   return formatDurationMs(Math.max(0, metrics.firstTokenTime - metrics.stepStartTime))
 }
 
+function ttfb(metrics: AssistantMetricDetail): string | null {
+  if (metrics.firstByteTime == null || metrics.stepStartTime === null) return null
+  return formatDurationMs(Math.max(0, metrics.firstByteTime - metrics.stepStartTime))
+}
+
 function generationTime(metrics: AssistantMetricDetail): string {
   if (metrics.streaming === false) return 'Not separately recorded'
   if (!metrics.timingRecorded || metrics.firstTokenTime === null) return 'First token unavailable'
@@ -340,13 +347,19 @@ function throughput(metrics: AssistantMetricDetail): string {
 }
 
 function AssistantTimingPanel({ metrics }: { metrics: AssistantMetricDetail }) {
+  const firstByte = ttfb(metrics)
   return (
     <dl className={css.overview}>
       <div><dt>Started</dt><StartedAtValue timestamp={metrics.stepStartTime} /></div>
       <div><dt>Total duration</dt><dd>{totalTime(metrics)}</dd></div>
+      {firstByte === null ? null : <div><dt>TTFB</dt><dd>{firstByte}</dd></div>}
       <div><dt>TTFT</dt><dd>{ttft(metrics)}</dd></div>
+      {metrics.retryCount ? <div><dt>Retries</dt><dd>{metrics.retryCount}</dd></div> : null}
       <div><dt>Generation</dt><dd>{generationTime(metrics)}</dd></div>
       <div><dt>Throughput</dt><dd>{throughput(metrics)}</dd></div>
+      {metrics.inputObserved === false
+        ? <div><dt>Request</dt><dd>Not observed; input unknown, output may be partial</dd></div>
+        : null}
     </dl>
   )
 }
@@ -585,11 +598,13 @@ function assistantToolCalls(
   return calls
 }
 
+function toolRecordName(record: TableRecord): string {
+  const separator = record.cell.text.indexOf(' · ')
+  return separator === -1 ? record.cell.text : record.cell.text.slice(0, separator)
+}
+
 function summarizeAssistantTools(records: readonly TableRecord[]): string {
-  const names = [...new Set(records.map((record) => {
-    const separator = record.cell.text.indexOf(' · ')
-    return separator === -1 ? record.cell.text : record.cell.text.slice(0, separator)
-  }).filter(name => name !== ''))]
+  const names = [...new Set(records.map(toolRecordName).filter(name => name !== ''))]
   const count = records.length
   const summary = `${count} tool ${count === 1 ? 'call' : 'calls'}`
   return names.length > 0 ? `${summary} · ${names.join(', ')}` : summary
@@ -675,6 +690,139 @@ function TokenRows({ cell }: { cell: TrajectoryCellProps }) {
         </div>
       )}
     </>
+  )
+}
+
+function formatChange(
+  before: number | null | undefined,
+  after: number | null | undefined,
+  format: (value: number | null) => string,
+): string {
+  return `${format(before ?? null)} → ${format(after ?? null)}`
+}
+
+/** Engine facts of a compaction phrased for the Summary list. */
+function CompactionFactRows({ facts }: { facts: CompactionFacts }) {
+  const tokensKnown = (facts.before?.tokens ?? null) !== null && (facts.after?.tokens ?? null) !== null
+  return (
+    <>
+      {facts.trigger !== undefined && (
+        <div>
+          <dt>Trigger</dt>
+          <dd title={facts.trigger}>{facts.trigger}</dd>
+        </div>
+      )}
+      {facts.processor !== undefined && (
+        <div>
+          <dt>Processor</dt>
+          <dd title={facts.processor}>{facts.processor}</dd>
+        </div>
+      )}
+      {facts.modelFree && (
+        <div>
+          <dt>Model</dt>
+          <dd>None · rule-based</dd>
+        </div>
+      )}
+      <div>
+        <dt>Tokens</dt>
+        <dd>
+          {tokensKnown
+            ? formatChange(facts.before?.tokens, facts.after?.tokens, formatTokenCount)
+            : '—'}
+        </dd>
+      </div>
+      {facts.savedTokens !== undefined && (
+        <div className={css.requestTokenDetail}>
+          <dt>Saved</dt>
+          <dd>
+            {formatTokenCount(facts.savedTokens)}
+            {facts.savedPercent === undefined ? '' : ` (${facts.savedPercent.toFixed(1)}%)`}
+          </dd>
+        </div>
+      )}
+      {facts.before !== undefined && facts.after !== undefined && (
+        <div>
+          <dt>Messages</dt>
+          <dd>
+            {formatChange(
+              facts.before.messages,
+              facts.after.messages,
+              value => (value === null ? '—' : String(value)),
+            )}
+          </dd>
+        </div>
+      )}
+    </>
+  )
+}
+
+const MODIFIED_ROLE_LABELS: Readonly<Record<string, string>> = {
+  tool: 'Tool result',
+  assistant: 'Assistant message',
+  user: 'User message',
+  system: 'System message',
+}
+
+function modifiedMessageTarget(
+  message: CompactionModifiedMessage,
+  records: readonly TableRecord[],
+): TableRecord | undefined {
+  if (message.toolCallId === undefined) return undefined
+  return records.find(record => (
+    (record.cell.kind === 'tool' || record.cell.kind === 'subtool')
+    && record.cell.callId === message.toolCallId
+  ))
+}
+
+/** What the compaction did to each message it rewrote, with a jump to the affected row. */
+function CompactionModifiedMessages({
+  facts,
+  records,
+  onOpenRecord,
+}: {
+  facts: CompactionFacts
+  records: readonly TableRecord[]
+  onOpenRecord: (record: TableRecord) => void
+}) {
+  const explanation = compactionExplanation(facts)
+  return (
+    <div className={css.compactionMessages}>
+      {explanation !== undefined && (
+        <p className={css.compactionExplanation}>{explanation}</p>
+      )}
+      <ul>
+        {facts.modifiedMessages.map((message) => {
+          const target = modifiedMessageTarget(message, records)
+          const roleLabel = MODIFIED_ROLE_LABELS[message.role] ?? 'Message'
+          const label = target === undefined ? roleLabel : `${roleLabel} · ${toolRecordName(target)}`
+          return (
+            <li key={message.messageId}>
+              {target === undefined
+                ? <span className={css.compactionMessageLabel}>{label}</span>
+                : (
+                  <button
+                    type="button"
+                    className={css.overviewHierarchyNavLink}
+                    onClick={() => { onOpenRecord(target) }}
+                  >
+                    <span>{label}</span>
+                    <IconChevronRightOutline14
+                      className={css.overviewHierarchyJumpIconTight}
+                      size={11}
+                    />
+                  </button>
+                )}
+              <span className={css.compactionMessageMeta}>
+                {message.offloadHandle === undefined
+                  ? 'Rewritten in place'
+                  : `Original offloaded to ${message.offloadType ?? 'storage'} · handle ${message.offloadHandle}`}
+              </span>
+            </li>
+          )
+        })}
+      </ul>
+    </div>
   )
 }
 
@@ -1027,9 +1175,19 @@ function RecordListText({
   displayText,
   toolCallOnly,
   toolCallText,
-}: Pick<RecordPresentationValue, 'displayText' | 'toolCallOnly' | 'toolCallText'>) {
+  thinkingOnly,
+}: Pick<RecordPresentationValue, 'displayText' | 'toolCallOnly' | 'toolCallText'> & {
+  thinkingOnly: boolean
+}) {
   if (toolCallOnly) {
     return <span className={css.toolCallOnly}>(tool call only)</span>
+  }
+  if (thinkingOnly) {
+    return (
+      <span className={css.thinkingPreview} data-testid="trajectory-thinking-preview">
+        {displayText || '—'}
+      </span>
+    )
   }
   if (toolCallText === undefined) return displayText || '—'
   return (
@@ -1987,6 +2145,28 @@ export function TrajectoryTable({
     : parentRecords(allRecords, selected)
   const selectedParentMessage = selectedParents.message
   const selectedParentTool = selectedParents.tool
+  const compactionIndexByToolCall = useMemo(
+    () => compactionsByToolCall(allRecords.map(record => record.cell)),
+    [allRecords],
+  )
+  const selectedCompactionFacts = selected?.cell.kind === 'compacted'
+    && selected.cell.compactionDetail !== undefined
+    ? compactionFacts(selected.cell.compactionDetail)
+    : undefined
+  // The compaction that later rewrote the selected tool result, if any.
+  const selectedToolCallId = selected?.cell.kind === 'tool' || selected?.cell.kind === 'subtool'
+    ? selected.cell.callId
+    : undefined
+  const selectedToolCompactionIndex = selectedToolCallId === undefined
+    ? undefined
+    : compactionIndexByToolCall.get(selectedToolCallId)
+  const selectedToolCompaction = selectedToolCompactionIndex === undefined
+    ? undefined
+    : allRecords.find(record => record.cell.index === selectedToolCompactionIndex)
+  const selectedToolOffloaded = selectedToolCompaction?.cell.compactionDetail !== undefined
+    && compactionFacts(selectedToolCompaction.cell.compactionDetail).modifiedMessages.some(message => (
+      message.toolCallId === selectedToolCallId && message.offloadHandle !== undefined
+    ))
   // The model request an assistant reply or a compaction outcome came from.
   const selectedSourceRequest = selected?.cell.kind === 'message' || selected?.cell.kind === 'compacted'
     ? requestNumbers.get(recordRequestKey(selected))
@@ -2267,6 +2447,7 @@ export function TrajectoryTable({
                 cell={record.cell}
               >
                 {({ displayText, listDisplayText, resultText, toolCallOnly, toolCallText }) => {
+                  const thinkingOnly = isThinkingOnlyPreview(record.cell)
                   const isCollapsedSummary = record.collapsedSummary !== undefined
                   const isRequestOnly = record.cell.requestOnly === true
                   const isInitialSystem = record.cell.kind === 'system'
@@ -2449,6 +2630,8 @@ export function TrajectoryTable({
                                               : css[record.cell.kind]
                                 }`}
                                 data-role-kind={record.cell.kind}
+                                data-testid="trajectory-record-kind"
+                                data-variant={record.cell.kind}
                               >
                                 <Tooltip
                                   label={KIND_LABEL[record.cell.kind]}
@@ -2488,6 +2671,7 @@ export function TrajectoryTable({
                                     displayText={displayText}
                                     toolCallOnly={toolCallOnly}
                                     toolCallText={toolCallText}
+                                    thinkingOnly={thinkingOnly}
                                   />
                                 </span>
                                 {resultText !== undefined && (
@@ -2906,13 +3090,37 @@ export function TrajectoryTable({
                   )}
                   <div>
                     <dt>Duration</dt>
-                    <dd>{formatElapsedSeconds(selected.cell.timeSeconds)}</dd>
+                    <dd>
+                      {selected.cell.timeSeconds === null
+                        && selectedCompactionFacts?.durationMs !== undefined
+                        ? formatDurationMillis(selectedCompactionFacts.durationMs)
+                        : formatElapsedSeconds(selected.cell.timeSeconds)}
+                    </dd>
                   </div>
-                  <div>
-                    <dt>Tokens</dt>
-                    <dd>—</dd>
-                  </div>
+                  {selectedCompactionFacts === undefined
+                    ? (
+                      <div>
+                        <dt>Tokens</dt>
+                        <dd>—</dd>
+                      </div>
+                    )
+                    : <CompactionFactRows facts={selectedCompactionFacts} />}
                 </dl>
+                {selectedCompactionFacts !== undefined
+                  && selectedCompactionFacts.modifiedMessages.length > 0 && (
+                  <div className={css.overviewSections}>
+                    <OverviewSection
+                      label={`Modified messages (${selectedCompactionFacts.modifiedMessages.length})`}
+                      onOpen={() => { activateTab('facts') }}
+                    >
+                      <CompactionModifiedMessages
+                        facts={selectedCompactionFacts}
+                        records={allRecords}
+                        onOpenRecord={openRecordSummary}
+                      />
+                    </OverviewSection>
+                  </div>
+                )}
                 {selected.cell.outputDetail !== undefined && (
                   <div
                     className={`${css.compactedSummary} ${css.summaryScrollRegion}`}
@@ -3006,6 +3214,29 @@ export function TrajectoryTable({
                             />
                           </button>
                         )}
+                      </dd>
+                    </div>
+                  )}
+                  {selectedToolCompaction !== undefined && (
+                    <div>
+                      <dt>Compaction</dt>
+                      <dd className={css.overviewParentLinks}>
+                        <button
+                          type="button"
+                          className={css.overviewHierarchyNavLink}
+                          title="Model requests after this compaction read the compacted result"
+                          onClick={() => { openRecordSummary(selectedToolCompaction) }}
+                        >
+                          <span>
+                            {selectedToolOffloaded
+                              ? 'Result shortened, original offloaded'
+                              : 'Result rewritten'}
+                          </span>
+                          <IconChevronRightOutline14
+                            className={css.overviewHierarchyJumpIconTight}
+                            size={11}
+                          />
+                        </button>
                       </dd>
                     </div>
                   )}

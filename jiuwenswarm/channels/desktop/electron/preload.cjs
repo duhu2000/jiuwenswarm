@@ -20,6 +20,7 @@ const desktopApi = Object.freeze({
   getCloseAction: () => invoke('desktop:get-close-action'),
   setCloseAction: action => invoke('desktop:set-close-action', action),
   openExternalUrl: url => invoke('desktop:open-external-url', url),
+  exportShareImage: (sessionId, locale) => invoke('desktop:export-share-image', sessionId, locale),
   downloadFile: (url, filename) => invoke('desktop:download-file', url, filename),
   installUpdate: installerPath => invoke('desktop:install-update', installerPath),
   saveDataUrl: (dataUrl, filename) => invoke('desktop:save-data-url', dataUrl, filename),
@@ -32,6 +33,7 @@ const desktopApi = Object.freeze({
   selectLocalFilePath: (initialPath, title) => invoke('desktop:select-local-file-path', initialPath, title),
   describeLocalFiles: paths => invoke('desktop:describe-local-files', paths),
   getClipboardFiles: () => invoke('desktop:get-clipboard-files'),
+  pasteClipboard: () => invoke('desktop:paste-clipboard'),
   clearHuaweiSignIn: () => invoke('auth:clear-huawei-sign-in'),
   onLayoutInvalidated: callback => {
     const listener = () => callback();
@@ -86,5 +88,6 @@ contextBridge.exposeInMainWorld('pywebview', {
     select_local_file_path: desktopApi.selectLocalFilePath,
     describe_local_files: desktopApi.describeLocalFiles,
     get_clipboard_files: desktopApi.getClipboardFiles,
+    paste_clipboard: desktopApi.pasteClipboard,
   },
 });

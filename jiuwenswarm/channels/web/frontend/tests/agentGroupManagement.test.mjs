@@ -147,8 +147,16 @@ test('only an unbound Team selection creates the first group payload', () => {
   assert.deepEqual(buildAgentGroupSelectionPayloadForMode('agent', { kind: 'select', id: 'review-team' }, null), {});
 });
 
-test('group view model separates catalog and mine scopes and searches tags', () => {
-  const local = normalizeAgentGroupListItem({ ...rawGroup, id: 'local-team', source: 'local', installed: false }, 'zh');
+test('group view model separates catalog and mine scopes and excludes tags from mine search', () => {
+  const local = normalizeAgentGroupListItem({
+    ...rawGroup,
+    id: 'local-team',
+    name: 'local-team',
+    displayName: { zh: '本地团队', en: 'Local Team' },
+    tags: [{ id: 'local-only', zh: '本地专属', en: 'Local only' }],
+    source: 'local',
+    installed: false,
+  }, 'zh');
   const item = normalizeAgentGroupListItem(rawGroup, 'zh');
   assert.equal(
     buildGroupCatalogViewModel([item, local], {
@@ -164,12 +172,37 @@ test('group view model separates catalog and mine scopes and searches tags', () 
     buildGroupCatalogViewModel([item, local], {
       scope: 'mine',
       category: '',
-      query: 'local-team',
+      query: '本地团队',
       page: 1,
       pageSize: 15,
     }).totalItems,
     1,
   );
+});
+
+test('ordinary Expert Team search does not match an internal Hub asset id', () => {
+  const result = buildGroupCatalogViewModel(
+    [
+      {
+        id: '93e6e963-0896-4473-8655-09f611bcddc8',
+        name: 'research-team',
+        displayName: '研究专家团',
+        description: '面向行业研究',
+        category: 'research',
+        source: 'hub',
+        installed: false,
+        memberCount: 0,
+        members: [],
+        skills: [],
+        tags: [],
+        avatarUrl: null,
+        capabilities: { canUse: false, canInstall: true, canUninstall: false, canPreviewFiles: true, canEdit: false, canPublish: false },
+      },
+    ],
+    { scope: 'catalog', category: '', query: '6', page: 1, pageSize: 20 },
+  );
+
+  assert.equal(result.totalItems, 0);
 });
 
 test('detail merge preserves detail data and authoritative list capability state', () => {
@@ -185,4 +218,25 @@ test('group upload accepts zip, tar and tar.gz only', () => {
   assert.equal(isAgentGroupUploadFilename('team.tar'), true);
   assert.equal(isAgentGroupUploadFilename('team.tar.gz'), true);
   assert.equal(isAgentGroupUploadFilename('team.json'), false);
+});
+
+test('mine group search matches bilingual display names only (#4473)', () => {
+  const item = normalizeAgentGroupListItem({
+    ...rawGroup, name: 'hidden-package-s-6',
+    displayName: { zh: '旅游规划专家团', en: 'Travel Team' },
+    displayDescription: { zh: '生成可执行旅行方案' },
+    category: 'hidden-category', tags: [{ zh: 'hidden-tag' }],
+  }, 'zh');
+  const search = query => buildGroupCatalogViewModel([item], {
+    scope: 'mine', category: '', query, page: 1, pageSize: 12,
+  }).items.length;
+  for (const query of ['生成', 'hidden', 's', '6']) assert.equal(search(query), 0, query);
+  for (const query of ['旅游', ' travel ', 'ＴＲＡＶＥＬ']) assert.equal(search(query), 1, query);
+});
+
+test('catalog filtering keeps description matches while mine excludes them', () => {
+  const item = normalizeAgentGroupListItem({ ...rawGroup, displayDescription: { zh: 'description-only' } }, 'zh');
+  const options = { category: '', query: 'description-only', page: 1, pageSize: 12 };
+  assert.equal(buildGroupCatalogViewModel([item], { ...options, scope: 'catalog' }).totalItems, 1);
+  assert.equal(buildGroupCatalogViewModel([item], { ...options, scope: 'mine' }).totalItems, 0);
 });

@@ -608,6 +608,35 @@ async def test_cron_backend_create_job_pushes_and_resets_route() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cron_backend_create_job_inherits_team_session_mode(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "jiuwenswarm.server.runtime.session.session_metadata.get_session_metadata",
+        lambda session_id, cache_bust=False: {
+            "mode": "team.work.normal" if session_id == "team-session" else "",
+        },
+    )
+    cron_tools = _FakeCronTools()
+    backend = _CronToolsCronBackend(cron_tools=cron_tools, message_handler=None)
+    context = SimpleNamespace(
+        channel_id="web",
+        session_id="team-session",
+        mode="agent.work.normal",  # The leader's tool context can be agent mode.
+        metadata={},
+    )
+
+    await backend.create_job(
+        {
+            "schedule": {"kind": "cron", "expr": "0 0 2 * * ? *"},
+            "payload": {"kind": "agentTurn", "message": "提醒上班"},
+            "delivery": {"channel": "web"},
+        },
+        context=context,
+    )
+
+    assert cron_tools.create_payloads[0]["mode"] == "team.work.normal"
+
+
+@pytest.mark.asyncio
 async def test_cron_backend_uses_bound_context_for_operations_without_context() -> None:
     """list/get/delete/toggle/preview/run_now 无显式 context 时回退 build_tools() 绑定的稳定上下文。"""
     cron_tools = _FakeCronTools()
@@ -714,7 +743,7 @@ async def test_cron_tools_create_job_uses_route_project_id_and_work_mode(
     # 本测试断言 route 上下文 model_name 透传，不依赖外部模型配置：patch 掉
     # 严格校验，与 test_cron_tools_update_job_validates_model 保持一致。
     monkeypatch.setattr(
-        "jiuwenswarm.agents.harness.common.tools.cron.cron_tools.validate_cron_model",
+        "jiuwenswarm.runtime.cron.models.validate_cron_model",
         lambda raw: str(raw).strip() or None,
     )
 
@@ -876,7 +905,7 @@ async def test_cron_tools_update_job_validates_model(tmp_path, monkeypatch) -> N
         targets="web",
     )
     monkeypatch.setattr(
-        "jiuwenswarm.agents.harness.common.tools.cron.cron_tools.validate_cron_model",
+        "jiuwenswarm.runtime.cron.models.validate_cron_model",
         lambda raw: "checked-model" if raw == "valid-model" else None,
     )
 
@@ -1194,7 +1223,6 @@ class TestComputeNextRunMissedTriggerWindow:
         assert push_dt == datetime(2026, 7, 24, 18, 25, 31, tzinfo=ZoneInfo("Asia/Shanghai"))
         assert wake_dt == push_dt
         assert run_id.startswith("one-shot:")
-
     def test_missed_trigger_beyond_window_raises(self) -> None:
         svc = _TestableScheduler.__new__(_TestableScheduler)
 

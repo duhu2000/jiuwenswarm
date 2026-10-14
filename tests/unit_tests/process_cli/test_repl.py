@@ -134,11 +134,11 @@ def test_cli_work_mode_follows_self_describing_mode(
 
 def test_invalid_choice_error_is_fully_chinese(capsys) -> None:
     with pytest.raises(SystemExit, match="2"):
-        build_parser().parse_args(["--work-mode", "invalid", "task"])
+        build_parser().parse_args(["--output", "invalid", "task"])
 
     error = capsys.readouterr().err
-    assert "参数 --work-mode 的值无效" in error
-    assert "可选值：'code', 'work'" in error
+    assert "参数 --output 的值无效" in error
+    assert "可选值：'human', 'json', 'jsonl'" in error
     assert "invalid choice" not in error
 
 
@@ -172,11 +172,38 @@ def test_worker_command_uses_a_fresh_process_entry_and_runtime_session() -> None
     assert "--_interactive-worker" in command
     assert "--_forwarded-live-input" in command
     assert command[command.index("--session") + 1] == "process_cli_session_1"
-    assert command[command.index("--mode") + 1] == "code.normal"
-    assert command[command.index("--work-mode") + 1] == "code"
+    assert command[command.index("--mode") + 1] == "agent.code.normal"
+    assert "--work-mode" not in command
     assert command[command.index("--_prompt-file") + 1] == "D:/temp/prompt.txt"
     assert "inspect this project" not in command
     assert "--_operation" not in command
+
+
+@pytest.mark.parametrize(
+    ("mode", "work_mode", "expected"),
+    [
+        ("agent", "work", "agent.work.normal"),
+        ("agent", "code", "agent.code.normal"),
+        ("agent.plan", "work", "agent.work.plan"),
+        ("team", "work", "team.work.normal"),
+        ("team", "code", "team.code.normal"),
+        ("agent.work.normal", "code", "agent.work.normal"),
+        ("code.normal", "work", "agent.code.normal"),
+    ],
+)
+def test_worker_mode_preserves_session_profile_without_work_mode_flag(
+    mode, work_mode, expected,
+) -> None:
+    command = repl._worker_command(
+        _args(mode=mode, work_mode=work_mode),
+        prompt_file="prompt.txt",
+        session_id="process_cli_session",
+        session_result_file="session.txt",
+    )
+    parsed = build_parser().parse_args(command[3:])
+    assert parsed.mode == expected
+    assert resolve_cli_work_mode(parsed.mode, parsed.work_mode) == expected.split(".")[1]
+    assert "--work-mode" not in command
 
 
 def test_worker_command_marks_runtime_invoke_operation() -> None:
@@ -366,6 +393,67 @@ async def test_parent_repl_forwards_steer_before_worker_runtime_is_ready(
 
 
 @pytest.mark.asyncio
+async def test_live_slash_commands_stay_local_and_cancel_worker(monkeypatch) -> None:
+    class FakeWriter:
+        def __init__(self) -> None:
+            self.data = bytearray()
+            self.closed = False
+
+        def write(self, data: bytes) -> None:
+            self.data.extend(data)
+
+        async def drain(self) -> None:
+            return
+
+        def is_closing(self) -> bool:
+            return self.closed
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def wait_closed(self) -> None:
+            return
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdin = FakeWriter()
+            self.returncode = None
+
+    lines = iter(("/unknown", "/mode team.code", "/cancel extra", "补充要求", "/cancel"))
+    interrupted = []
+
+    async def fake_read_live_prompt(_session, _layout) -> str:
+        return next(lines)
+
+    async def fake_interrupt_worker(process) -> None:
+        interrupted.append(process)
+        process.returncode = 130
+
+    monkeypatch.setattr(repl, "_read_live_prompt", fake_read_live_prompt)
+    monkeypatch.setattr(repl, "_interrupt_worker", fake_interrupt_worker)
+    process = FakeProcess()
+    layout = repl.LiveTurnLayout("initial")
+    cancel_requested = asyncio.Event()
+
+    await repl._forward_live_input(
+        process,
+        prompt_session=object(),
+        layout=layout,
+        cancel_requested=cancel_requested,
+    )
+
+    assert bytes(process.stdin.data) == "补充要求\n".encode()
+    assert [supplement.text for supplement in layout.supplements] == ["补充要求"]
+    assert len(layout.notices) == 4
+    assert "未知命令" in layout.notices[0]
+    assert "暂不能执行 /mode" in layout.notices[1]
+    assert layout.notices[2] == "用法：/cancel"
+    assert cancel_requested.is_set()
+    assert interrupted == [process]
+    assert process.stdin.closed
+
+
+@pytest.mark.asyncio
 async def test_worker_output_is_relayed_above_the_parent_prompt() -> None:
     reader = asyncio.StreamReader()
     reader.feed_data("模型输出".encode())
@@ -491,6 +579,74 @@ async def test_run_worker_owns_prompt_and_pipes_from_spawn_until_exit(
     assert observed_layout[0].supplements[0].status == "accepted"
     assert observed_layout[0].output_text == "worker model output\n"
     assert capsys.readouterr().out.count("worker model output") == 1
+
+
+@pytest.mark.asyncio
+async def test_live_cancel_returns_interrupt_code_without_worker_diagnostics(
+    monkeypatch,
+    capsys,
+) -> None:
+    class FakeWriter:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def is_closing(self) -> bool:
+            return self.closed
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def wait_closed(self) -> None:
+            return
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdin = FakeWriter()
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            self.returncode = None
+            self.exited = asyncio.Event()
+
+        async def wait(self) -> int:
+            await self.exited.wait()
+            return self.returncode
+
+    process = FakeProcess()
+
+    async def fake_create_subprocess_exec(*_command, **_kwargs):
+        return process
+
+    async def fake_read_live_prompt(_session, _layout) -> str:
+        return "/cancel"
+
+    async def fake_interrupt_worker(interrupted_process) -> None:
+        assert interrupted_process is process
+        process.returncode = -2
+        process.stdout.feed_eof()
+        process.stderr.feed_eof()
+        process.exited.set()
+
+    class FakeApp:
+        is_running = False
+
+    class FakePromptSession:
+        app = FakeApp()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(repl, "_read_live_prompt", fake_read_live_prompt)
+    monkeypatch.setattr(repl, "_interrupt_worker", fake_interrupt_worker)
+    monkeypatch.setattr(repl, "_create_live_prompt_session", FakePromptSession)
+
+    result = await repl._run_worker(
+        _args(),
+        prompt="initial request",
+        session_id="runtime-session",
+        prompt_session=object(),
+    )
+
+    assert result == (130, "runtime-session")
+    assert process.stdin.closed
+    assert "正在中断当前任务" in capsys.readouterr().out
 
 
 @pytest.mark.asyncio
@@ -756,6 +912,30 @@ async def test_repl_mode_switch_is_local_and_next_worker_uses_canonical_mode(
     assert "当前模式：agent.code" in output
     assert "已切换模式：team.code" in output
     assert "用法：/mode <agent.work|agent.code|team.work|team.code>" in output
+
+
+@pytest.mark.asyncio
+async def test_repl_unknown_slash_and_idle_cancel_do_not_start_worker(
+    monkeypatch,
+    capsys,
+) -> None:
+    prompts = iter(("/unknown value", "/cancel", "/exit"))
+
+    async def fake_read_prompt(_session) -> str:
+        return next(prompts)
+
+    async def fail_run_worker(*_args, **_kwargs):
+        pytest.fail("local slash commands must not start a Runtime worker")
+
+    monkeypatch.setattr(repl, "_read_prompt", fake_read_prompt)
+    monkeypatch.setattr(repl, "_create_prompt_session", lambda: None)
+    monkeypatch.setattr(repl, "_run_worker", fail_run_worker)
+    monkeypatch.setattr(repl, "_resolve_configured_model_name", lambda: "model")
+
+    assert await repl.run_repl(_args()) == 0
+    output = capsys.readouterr().out
+    assert "未知命令：/unknown" in output
+    assert "当前没有运行中的任务" in output
 
 
 @pytest.mark.asyncio

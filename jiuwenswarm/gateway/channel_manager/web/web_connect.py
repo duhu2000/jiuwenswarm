@@ -22,6 +22,11 @@ from urllib.parse import parse_qs, urlparse
 
 from websockets.exceptions import ConnectionClosed as WebSocketConnectionClosed
 
+from jiuwenswarm.common.protocol_ids import (
+    InvalidProtocolId,
+    validate_session_id,
+    validate_workflow_run_id,
+)
 from jiuwenswarm.common.utils import get_logs_dir
 from jiuwenswarm.gateway.channel_manager.base import ChannelMetadata, RobotMessageRouter, ConnectHook
 from jiuwenswarm.gateway.routing.base_ws_channel import BaseWsChannel
@@ -31,6 +36,10 @@ from jiuwenswarm.common.security.ws_origin import (
     get_header_value,
 )
 from jiuwenswarm.common.schema.message import EventType, Message, Mode, ReqMethod
+from jiuwenswarm.common.session_message import (
+    SESSION_MESSAGE_ANONYMOUS_OWNER_METADATA_KEY,
+    SESSION_MESSAGE_OWNER_SCOPE_METADATA_KEY,
+)
 from jiuwenswarm.common.ws_diagnostics import (
     describe_ws_exception,
     describe_ws_peer,
@@ -74,6 +83,13 @@ def _resolve_ws_auth_session(ws: Any) -> str:
 
 _HANDLER_BEFORE_CALLBACK_METHODS = frozenset({ReqMethod.CHAT_SEND.value})
 _LOCAL_ONLY_METHODS: frozenset[str] = frozenset()
+_SWARMFLOW_CONTROL_METHODS = frozenset(
+    {
+        ReqMethod.SWARMFLOW_PAUSE.value,
+        ReqMethod.SWARMFLOW_RESUME.value,
+        ReqMethod.SWARMFLOW_STOP.value,
+    }
+)
 
 _STREAM_COALESCE_EVENT_TYPES = frozenset({"chat.delta", "chat.reasoning"})
 _STREAM_COALESCE_MAX_FRAMES = 32
@@ -104,6 +120,9 @@ _WEB_FULL_PAYLOAD_EVENT_TYPES = frozenset(
         "chat.symphony_status",
         "chat.notice",
         "chat.message_updated",
+        "session.message.updated",
+        "a4p.authorization_request",
+        "a4p.authorization_terminated",
         "history.message",
         "chat.session_result",
         "chat.usage_metadata",
@@ -330,6 +349,19 @@ class WebChannel(BaseWsChannel):
 
         self._on_message_cb = wrapped
 
+    def _enqueue_send(self, ws: Any, data: Any) -> None:
+        # All unary, streamed and pushed frames converge here, after internal
+        # callbacks and busy-state tracking have consumed the canonical values.
+        from jiuwenswarm.gateway.routing.e2a_proxy import is_agentos_routing_client
+
+        if is_agentos_routing_client(self.agent_client):
+            from jiuwenswarm.gateway.channel_manager.web.agentos_compat import (
+                project_agentos_web_frame,
+            )
+
+            data = project_agentos_web_frame(data)
+        super()._enqueue_send(ws, data)
+
     # ── 帧发送 API（公开给处理器使用）─────────────────────
 
     async def send_response(
@@ -417,6 +449,10 @@ class WebChannel(BaseWsChannel):
 
     @classmethod
     def _resolve_connection_user_id(cls, flat_query: dict[str, str], ws: Any) -> str | None:
+        # 会话身份以客户端声明为准（query user_id / X-User-Id 头，值为 username），
+        # 与 agent_os 稳定版一致。authenticated_user_id（IAM UUID）只作认证门禁，
+        # 不参与工作区/沙箱身份推导：现有部署的用户目录按 username 布局
+        # （/home/agentos/users/<username>），用 UUID 会导致建沙箱时目录校验失败。
         connection_user_id = cls._extract_query_user_id(flat_query) or cls._extract_ws_header_user_id(ws)
         setattr(ws, _WEB_CONNECTION_USER_ID_ATTR, connection_user_id)
         return connection_user_id
@@ -783,12 +819,15 @@ class WebChannel(BaseWsChannel):
 
     @staticmethod
     def _should_preserve_full_payload(event_name: str) -> bool:
+        """Keep structured Organization milestones available to the Web client."""
         return (
             event_name in _WEB_FULL_PAYLOAD_EVENT_TYPES
             or event_name in {"chat.input_received", "chat.output_phase"}
+            or event_name.startswith("a4p.")
             or event_name.startswith("team.")
             or event_name.startswith("harness.")
             or event_name.startswith("personal_context.context.")
+            or event_name.startswith("org.")
         )
 
     @staticmethod
@@ -851,6 +890,7 @@ class WebChannel(BaseWsChannel):
                 "request_id", "turn_request_id", "execution_id", "final_mode", "segment_id",
                 "output_phase_id", "output_suppressed", "output_order", "timestamp",
                 "message_origin", "session_message_id", "cross_session",
+                "team_name", "team_id",
                 # 主动推荐标记需透传到所有 chunk 事件（chat.delta/chat.reasoning/…），
                 # 否则前端无法按 source 短路：proactive 的 chat.reasoning 会被当作
                 # 用户轮思考流追加进 reasoningSegments，污染上一条消息的思考状态。
@@ -971,6 +1011,21 @@ class WebChannel(BaseWsChannel):
                 "[WebChannel] proactive_notification broadcast to %d client(s) id=%s",
                 len(clients), getattr(msg, "id", ""),
             )
+            return
+
+        if _et == "session.message.updated":
+            metadata = msg.metadata if isinstance(msg.metadata, dict) else {}
+            owner_scope_id = str(metadata.get(SESSION_MESSAGE_OWNER_SCOPE_METADATA_KEY) or "").strip()
+            if not owner_scope_id or not msg.session_id:
+                logger.warning("[WebChannel] dropping session.message.updated without owner or session")
+                return
+            anonymous_owner = metadata.get(SESSION_MESSAGE_ANONYMOUS_OWNER_METADATA_KEY)
+            if owner_scope_id == "local" and not isinstance(anonymous_owner, bool):
+                return
+            clients = self._session_message_target_clients(
+                msg.session_id, owner_scope_id, anonymous_owner
+            )
+            await self._broadcast_to(self._serialize_frame(msg), clients)
             return
 
         if msg.type == "res":
@@ -1153,6 +1208,33 @@ class WebChannel(BaseWsChannel):
                 "payload": {"session_id": msg.session_id, "is_processing": is_processing},
             }, all_clients)
 
+    def _session_message_target_clients(
+        self,
+        session_id: str,
+        owner_scope_id: str,
+        anonymous_owner: Any,
+    ) -> set[Any]:
+        """收集绑定到指定 session 且匹配 owner 归属的活跃 websocket。
+
+        anonymous_owner 为真时无主连接（user_id 为 None）可见，
+        否则仅 user_id 等于 owner_scope_id 的连接可见。
+        """
+        clients: set[Any] = set()
+        for rk, ws_list in self._clients_by_key.items():
+            if rk.session_id != session_id:
+                continue
+            for ws in ws_list:
+                if getattr(ws, "closed", False):
+                    continue
+                ws_user_id = self.connection_user_id(ws)
+                owner_matched = (
+                    ws_user_id is None if anonymous_owner
+                    else ws_user_id == owner_scope_id
+                )
+                if owner_matched:
+                    clients.add(ws)
+        return clients
+
     def _track_session_busy(self, msg: Message) -> None:
         """在所有路由分支之前维护 session busy 映射(供 /ws/git 写操作查询)。
 
@@ -1238,7 +1320,22 @@ class WebChannel(BaseWsChannel):
         _app_id = _flat_query.get("app_id", "default")
         _mode = _flat_query.get("mode", "agent")
         _agent_id = _flat_query.get("agent_id", "default")
-        _initial_sid = _flat_query.get("session_id", self._make_session_id())
+        _raw_initial_sid = _flat_query.get("session_id")
+        try:
+            _initial_sid = (
+                validate_session_id(_raw_initial_sid)
+                if _raw_initial_sid
+                else self._make_session_id()
+            )
+        except InvalidProtocolId as exc:
+            logger.warning(
+                "[WebChannel] rejected websocket with invalid session_id: reason=%s remote=%s path=%s",
+                exc,
+                remote,
+                request_path,
+            )
+            await ws.close(code=1008, reason=str(exc))
+            return
         uid_marker = "" if connection_user_id else " uid_empty=yes"
         logger.info(
             "[WebChannel] ws.connect user_id=%s session_id=%s channel=web remote=%s path=%s%s",
@@ -1365,6 +1462,24 @@ class WebChannel(BaseWsChannel):
         断连 ``finally`` 先后调 ``unregister_ws(ws)`` 和
         ``git_watcher_registry.cleanup_ws(ws)``,避免 watcher 仍继续轮询推送。
         """
+        # session_id 为传输层占位,不是聊天会话(设计文档 §5.3.7),但仍是路由键
+        # 与日志内容:非法输入须先于 registry 检查与注册被拒绝。
+        _raw_git_session_id = flat_query.get("session_id")
+        try:
+            _session_id = (
+                validate_session_id(_raw_git_session_id)
+                if _raw_git_session_id
+                else f"gitws_{uuid.uuid4().hex[:12]}"
+            )
+        except InvalidProtocolId as exc:
+            logger.warning(
+                "[WebChannel] rejected websocket with invalid session_id: reason=%s remote=%s path=/ws/git",
+                exc,
+                remote,
+            )
+            await ws.close(code=1008, reason=str(exc))
+            return
+
         registry = getattr(self, "git_watcher_registry", None)
         if registry is None:
             await ws.close(code=1011, reason="git watcher registry not available")
@@ -1379,8 +1494,6 @@ class WebChannel(BaseWsChannel):
             ws, flat_query, remote, route_type="git",
         )
         _app_id = flat_query.get("app_id", "default")
-        # session_id 为传输层占位,不是聊天会话(设计文档 §5.3.7)
-        _session_id = flat_query.get("session_id") or f"gitws_{uuid.uuid4().hex[:12]}"
         _rk = RoutingKey(
             user_id=_user_id,
             channel_id=self.channel_id,
@@ -1467,10 +1580,34 @@ class WebChannel(BaseWsChannel):
         # 仅合成一个临时 id 供后续 Message 构造使用，但【不】参与 register_ws，
         # 保留 ws 上一次的真实 RoutingKey，避免把 ws 从其所属 team session 摘除。
         _explicit_session_id = params.get("session_id")
-        has_explicit_session = (
-            isinstance(_explicit_session_id, str) and bool(_explicit_session_id)
-        )
-        session_id = _explicit_session_id if has_explicit_session else self._make_session_id()
+        has_explicit_session = _explicit_session_id is not None and _explicit_session_id != ""
+        try:
+            session_id = (
+                validate_session_id(_explicit_session_id)
+                if has_explicit_session
+                else self._make_session_id()
+            )
+            if method in _SWARMFLOW_CONTROL_METHODS:
+                run_id = params.get("run_id")
+                workflow_run_id = params.get("workflow_run_id")
+                if (
+                    run_id not in (None, "")
+                    and workflow_run_id not in (None, "")
+                    and run_id != workflow_run_id
+                ):
+                    raise InvalidProtocolId(
+                        "run_id and workflow_run_id must match"
+                    )
+                validate_workflow_run_id(run_id or workflow_run_id)
+        except InvalidProtocolId as exc:
+            await self.send_response(
+                ws,
+                req_id,
+                ok=False,
+                error=str(exc),
+                code="BAD_REQUEST",
+            )
+            return
 
         # 追踪 ws → 真实 session_id，用于断连清理/日志。
         # 与 register_ws 一致：仅显式 session 入集；临时 id 只供 Message 构造，避免膨胀。
