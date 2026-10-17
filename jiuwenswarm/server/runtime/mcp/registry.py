@@ -731,7 +731,7 @@ def build_config_entry(name: str) -> dict[str, Any] | None:
         entry["timeout_s"] = int(cfg["timeout"])
     entry["enabled"] = True
     entry["server_id_scope"] = f"mcp:{n}"
-    from jiuwenswarm.server.runtime.mcp.remote_oauth import OAuthError, oauth_manager, supports_oauth
+    from jiuwenswarm.common.mcp_remote_oauth import OAuthError, oauth_manager, supports_oauth
     if supports_oauth(n, entry):
         entry["oauth_provider"] = None  # clear a previous OAuth mode on API Key switch
         try:
@@ -746,7 +746,7 @@ def build_config_entry(name: str) -> dict[str, Any] | None:
 
 def cancel_remote_oauth(name: str, session: str) -> None:
     """Discard only this unfinished flow's state; preserve a newer connection."""
-    from jiuwenswarm.server.runtime.mcp.remote_oauth import oauth_manager
+    from jiuwenswarm.common.mcp_remote_oauth import oauth_manager
     from jiuwenswarm.server.runtime.mcp.state_store import remove_mcp_record
 
     manager = oauth_manager()
@@ -759,7 +759,7 @@ def cancel_remote_oauth(name: str, session: str) -> None:
 
 
 def supports_remote_oauth(name: str) -> bool:
-    from jiuwenswarm.server.runtime.mcp.remote_oauth import supports_oauth
+    from jiuwenswarm.common.mcp_remote_oauth import supports_oauth
     # Validate the installed package's actual destination, not only its name.
     cfg = _marketplace_mcp_cfg(name)
     return supports_oauth(name, {
@@ -781,7 +781,7 @@ def cancel_connect(name: str) -> dict[str, Any]:
         raise ValueError("mcp name is required")
     _CONNECT_CANCELLED.add(n)
     if n == "qcc-company":
-        from jiuwenswarm.server.runtime.mcp.remote_oauth import oauth_manager
+        from jiuwenswarm.common.mcp_remote_oauth import oauth_manager
         manager = oauth_manager()
         with manager.lock:
             pending = manager.pending.get(n)
@@ -1371,7 +1371,7 @@ def disconnect_mcp(name: str) -> dict[str, Any]:
     if not n:
         raise ValueError("mcp name is required")
     if n == "qcc-company":
-        from jiuwenswarm.server.runtime.mcp.remote_oauth import oauth_manager
+        from jiuwenswarm.common.mcp_remote_oauth import oauth_manager
         if not oauth_manager().disconnect(n):
             logger.warning("[mcp] OAuth revoked locally; remote revocation unavailable for %s", n)
     from jiuwenswarm.server.runtime.mcp.state_store import (
@@ -1561,7 +1561,7 @@ def save_mcp_credentials(name: str, tokens: dict[str, Any]) -> dict[str, Any]:
             continue
         store.save_token(n, str(key), str(value))
     if n == "qcc-company":
-        from jiuwenswarm.server.runtime.mcp.remote_oauth import OAuthError, oauth_manager
+        from jiuwenswarm.common.mcp_remote_oauth import OAuthError, oauth_manager
         if store.get_token(n, "QICHACHA_API_KEY") != str(tokens["QICHACHA_API_KEY"]):
             raise OAuthError("Could not save API Key. Existing authorization retained.")
         oauth_manager().disconnect(n)
@@ -1589,3 +1589,18 @@ __all__ = [
     "CODE_CREDENTIALS_INVALID",
     "CODE_INSTALL_SCRIPT_DEP",
 ]
+
+
+# --------------------------------------------------------------------------- #
+# common 注入点自注册：import 即注册，供 common 经
+# ``common.external_providers.provider("mcp_registry")`` 反向取用（分层规则 R1）。
+# --------------------------------------------------------------------------- #
+def _register_common_provider() -> None:
+    import sys
+
+    from jiuwenswarm.common.external_providers import register
+
+    register("mcp_registry", sys.modules[__name__])
+
+
+_register_common_provider()

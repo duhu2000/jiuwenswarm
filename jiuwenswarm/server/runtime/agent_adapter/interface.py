@@ -23,12 +23,10 @@ import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Tuple
 
-from gateway_protocol.hooks import AgentServerHookEvents, MemoryHookContext
-
 from jiuwenswarm.dotenv_early import load_dotenv_runtime
 from jiuwenswarm.common.session_message import (
     SESSION_MESSAGE_INTERNAL_KEY,
-    SESSION_MESSAGE_ORIGIN,
+    with_cross_session_history_metadata,
 )
 
 from jiuwenswarm.agents.harness.common.rails.permissions.tool_permission_context import (
@@ -45,6 +43,12 @@ from jiuwenswarm.server.runtime.session.session_history import (
     append_compact_history_records,
     append_history_record,
     collapse_file_content_blocks,
+    resolve_final_record_timestamp,
+)
+from jiuwenswarm.server.runtime.agent_adapter.team_member_stream_history import (
+    MEMBER_SEGMENT_BOUNDARY_EVENTS,
+    TeamMemberStreamHistory,
+    team_member_stream_key,
 )
 from jiuwenswarm.server.runtime.agent_adapter.user_turn import TEAM_USER_TURN_KEY, UserTurn
 from jiuwenswarm.server.runtime.agent_adapter.statusline_setup_agent import (
@@ -52,6 +56,10 @@ from jiuwenswarm.server.runtime.agent_adapter.statusline_setup_agent import (
     build_statusline_setup_dispatch,
 )
 from jiuwenswarm.server.runtime.session.session_manager import SessionManager
+from jiuwenswarm.runtime.session.model import (
+    TEAM_ATTACH_ONLY_PARAM,
+    TEAM_EXECUTION_CONTEXT_METADATA_KEY,
+)
 from jiuwenswarm.server.runtime.skill.skill_manager import SkillManager, SkillRpcError
 from jiuwenswarm.server.runtime.session_assets import get_session_asset_manager
 from jiuwenswarm.server.runtime.skill.archive_store import ARCHIVE_DIRNAME
@@ -92,6 +100,8 @@ from jiuwenswarm.common.context_keys import (
 from jiuwenswarm.extensions.registry import ExtensionRegistry
 from jiuwenswarm.common.schema.agent import AgentRequest, AgentResponse, AgentResponseChunk
 from jiuwenswarm.common.chat_final import ensure_final_mode_inplace
+from jiuwenswarm.extensions.hook_event import AgentServerHookEvents
+from jiuwenswarm.extensions.hooks_context import MemoryHookContext
 from jiuwenswarm.common.schema.message import EventType, ReqMethod
 from jiuwenswarm.common.utils import (
     apply_free_search_runtime_defaults,
@@ -340,6 +350,10 @@ def _should_record_user_history(params: Any) -> bool:
     # Second-step goal attach is host control traffic, not a user utterance.
     if params.get("attach_goal") is True:
         return False
+    # An attach-only subscription submits no input at all; a record here would
+    # leave a dangling user turn that makes the frontend wait forever.
+    if params.get(TEAM_ATTACH_ONLY_PARAM) is True:
+        return False
     if is_interrupt_resume_payload(params):
         return False
     return str(params.get("source") or "") != "proactive_recommendation"
@@ -389,23 +403,6 @@ async def _persist_ask_user_answer_history(
         },
         mode=params.get("mode", "unknown"),
     )
-
-
-def _resolve_final_record_timestamp(
-    *,
-    event_type: str,
-    segment_started_at: float | None,
-    extra_fields: dict[str, Any] | None,
-) -> float:
-    """chat.final 落盘用「气泡出现的时刻」，收尾时刻另存 completed_at。"""
-    completed_at = time.time()
-    if event_type != "chat.final" or not segment_started_at:
-        return completed_at
-    if segment_started_at >= completed_at:
-        return completed_at
-    if isinstance(extra_fields, dict):
-        extra_fields.setdefault("completed_at", completed_at)
-    return segment_started_at
 
 
 def _history_media_string(item: dict[str, Any], *keys: str) -> str | None:
@@ -492,7 +489,9 @@ def _history_user_extra(params: Any) -> dict[str, Any] | None:
     if not isinstance(params, dict):
         return None
 
-    extra = _with_cross_session_history_metadata(None, params) or {}
+    extra = with_cross_session_history_metadata(
+        None, _cross_session_marker_from_params(params)
+    ) or {}
     raw_media_items = params.get("media_items")
     if isinstance(raw_media_items, list):
         media_items: list[dict[str, Any]] = []
@@ -533,35 +532,11 @@ def _history_user_extra(params: Any) -> dict[str, Any] | None:
     return _with_heartbeat_history_metadata(extra, params)
 
 
-def _with_cross_session_history_metadata(
-    extra: dict[str, Any] | None,
-    params: Any,
-) -> dict[str, Any] | None:
-    """Persist the public origin marker on cross-Session assistant records."""
-    result = dict(extra or {})
+def _cross_session_marker_from_params(params: Any) -> Any:
+    """Extract the internal cross-Session marker from request params."""
     if not isinstance(params, dict):
-        return result or None
-    raw_cross_session = params.get(SESSION_MESSAGE_INTERNAL_KEY)
-    if not isinstance(raw_cross_session, dict):
-        return result or None
-    cross_session: dict[str, Any] = {}
-    for key in (
-        "message_id",
-        "source_session_id",
-        "source_title",
-        "chain_id",
-        "parent_message_id",
-        "hop_count",
-        "language",
-    ):
-        if key in raw_cross_session:
-            cross_session[key] = raw_cross_session[key]
-    result["message_origin"] = SESSION_MESSAGE_ORIGIN
-    result["cross_session"] = cross_session
-    message_id = str(cross_session.get("message_id") or "").strip()
-    if message_id:
-        result["session_message_id"] = message_id
-    return result
+        return None
+    return params.get(SESSION_MESSAGE_INTERNAL_KEY)
 
 
 def _web_agent_template_name(params: Any, channel_id: Any) -> str | None:
@@ -1365,7 +1340,6 @@ class JiuWenSwarm:
         if callable(refresher):
             await refresher()
 
-
     def set_permissions_changed_notifier(
         self,
         notifier: Callable[[], None] | None,
@@ -1533,6 +1507,12 @@ class JiuWenSwarm:
         elif include_legacy:
             await self.reload_agent_config(config_base=config, env_overrides={})
 
+    async def prepare_kernel(self, *, mode: str) -> None:
+        adapter = self._ensure_adapter(mode="code" if mode.startswith("code") else "agent")
+        prepare = getattr(adapter, "prepare_kernel", None)
+        if callable(prepare):
+            await prepare()
+
     async def prepare_session(
         self,
         *,
@@ -1619,6 +1599,7 @@ class JiuWenSwarm:
         param_metadata = params.get("metadata") if isinstance(params, dict) else None
         if isinstance(param_metadata, dict):
             metadata = {**metadata, **param_metadata}
+        metadata.pop(TEAM_EXECUTION_CONTEXT_METADATA_KEY, None)
         origin_kind = (
             HOST_USER_ORIGIN_EXTERNAL
             if is_external_user_authored_dispatch(
@@ -2780,6 +2761,15 @@ class JiuWenSwarm:
             )
 
         adapter = self._ensure_adapter(mode=self._adapter_mode_for_request(request))
+        external_session_checker = getattr(
+            adapter,
+            "is_external_harness_session",
+            None,
+        )
+        is_external_session = bool(
+            callable(external_session_checker)
+            and external_session_checker(request.session_id)
+        )
 
         if intent == "pause":
             # 暂停：不取消任务，只暂停 ReAct 循环
@@ -2792,6 +2782,8 @@ class JiuWenSwarm:
         if intent == "supplement":
             # 取消当前 session 的任务
             response = await adapter.process_interrupt(request)
+            if is_external_session:
+                return response
             await self._session_manager.cancel_session_task(session_id, "interrupt(supplement): ")
             return response
 
@@ -2799,6 +2791,8 @@ class JiuWenSwarm:
         # guard 能通过），再 cancel_session_task（其 finally 会把 session 从 _active_session_ids 移除）。
         # 顺序不能反，否则 process_interrupt 的 session guard 会误判为 "not active" 而跳过 abort。
         response = await adapter.process_interrupt(request)
+        if is_external_session:
+            return response
         await self._cancel_team_work_for_session(
             session_id,
             request.channel_id,
@@ -3150,11 +3144,38 @@ class JiuWenSwarm:
         # connectors before the agent runs. Always pass a list (never None):
         # empty clears selection when neither side contributes names.
         params = request.params if isinstance(request.params, dict) else {}
+        try:
+            runtime_binding = self._resolve_runtime_binding_for_request(
+                adapter,
+                request,
+                session_id,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            return AgentResponse(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                ok=False,
+                payload={"error": str(exc)},
+                metadata=request.metadata,
+            )
+        reconcile_kwargs: dict[str, Any] = {
+            "model_name": params.get("model_name"),
+            "history_before_request_id": request.request_id,
+        }
+        if runtime_binding is not None:
+            reconcile_kwargs["runtime_binding"] = runtime_binding
+        if params.get("model_selection") is not None:
+            reconcile_kwargs["model_selection"] = params["model_selection"]
+        if "moa_enabled" in params:
+            reconcile_kwargs["moa_enabled"] = params["moa_enabled"]
+        moa_access = getattr(adapter, "moa_access_kwargs", None)
+        if callable(moa_access):
+            reconcile_kwargs.update(moa_access(request))
+        reconcile_kwargs["execution_request"] = request
         await self.reconcile_session_mcp(
             request.session_id,
             compute_chat_send_mcp_needed(params),
-            model_name=params.get("model_name"),
-            history_before_request_id=request.request_id,
+            **reconcile_kwargs,
         )
 
         # cloud memory: before chat hook
@@ -3315,6 +3336,11 @@ class JiuWenSwarm:
             compute_chat_send_mcp_needed(params),
             model_name=params.get("model_name"),
             history_before_request_id=request.request_id,
+            execution_request=request,
+            retain_moa_snapshot=True,
+            **({"model_selection": params["model_selection"]} if params.get("model_selection") is not None else {}),
+            **({"moa_enabled": params["moa_enabled"]} if "moa_enabled" in params else {}),
+            **(adapter.moa_access_kwargs(request) if callable(getattr(adapter, "moa_access_kwargs", None)) else {}),
         )
         # 问题澄清答案 resume 走的是 control-input 路径（Runtime.session_work_kind 判定
         # 为 CONTROL_INPUT → _deliver_control → 本方法），**不经过** process_message_stream，
@@ -3336,7 +3362,7 @@ class JiuWenSwarm:
         # 整段回复凭空消失。
         pending_final_chunks: list[str] = []
         # 首个非空 delta 到达时刻——对齐 pms 的 durable_pending_final_started_at，
-        # 合并落盘时作 segment_started_at 传给 _resolve_final_record_timestamp，
+        # 合并落盘时作 segment_started_at 传给 resolve_final_record_timestamp，
         # 使 chat.final 记录的 timestamp=气泡起始时刻、extra.completed_at=收尾时刻
         # （与 pms 路径时间语义一致）。
         # 单元素 list 持有首个非空 delta 时刻——list 可变，让 _persist_control_chunk_to_history
@@ -3397,7 +3423,7 @@ class JiuWenSwarm:
         场景正文只在 delta 里，刷新后整段回复凭空消失（#与 pms 同源问题）。
 
         pending_final_started_at_holder 是单元素 list，持有首个非空 delta 到达时刻，
-        合并落盘时作 segment_started_at 传给 _resolve_final_record_timestamp，使
+        合并落盘时作 segment_started_at 传给 resolve_final_record_timestamp，使
         chat.final 记录 timestamp=气泡起始时刻、completed_at=收尾时刻（对齐 pms）。
         用 list 容器是为了让本方法能「读 + 重置」调用方闭包里的时刻（Python tuple
         不可变，故用 list）。
@@ -3461,7 +3487,7 @@ class JiuWenSwarm:
         extra_fields = {k: v for k, v in payload.items() if k not in ("event_type", "content")}
         if not isinstance(extra_fields, dict):
             extra_fields = {}
-        extra_fields = _with_cross_session_history_metadata(
+        extra_fields = with_cross_session_history_metadata(
             _with_heartbeat_history_metadata(
                 _with_web_agent_template_metadata(
                     extra_fields,
@@ -3472,12 +3498,12 @@ class JiuWenSwarm:
                 ),
                 request.params,
             ),
-            request.params,
+            _cross_session_marker_from_params(request.params),
         ) or {}
         # chat.final 用气泡起始时刻（对齐 pms line 4142 传 final_segment_started_at）；
-        # 其余事件传 None（_resolve_final_record_timestamp 对非 final 事件忽略此参数）。
+        # 其余事件传 None（resolve_final_record_timestamp 对非 final 事件忽略此参数）。
         record_segment_started_at = final_segment_started_at if et == "chat.final" else None
-        record_timestamp = _resolve_final_record_timestamp(
+        record_timestamp = resolve_final_record_timestamp(
             event_type=et,
             segment_started_at=record_segment_started_at,
             extra_fields=extra_fields,
@@ -3512,7 +3538,7 @@ class JiuWenSwarm:
         空 final 场景正文只在 delta 里，刷新后 delta 被过滤、空 final 被空壳规则丢弃，
         整段回复凭空消失。
 
-        segment_started_at 为首个非空 delta 到达时刻，传给 _resolve_final_record_timestamp
+        segment_started_at 为首个非空 delta 到达时刻，传给 resolve_final_record_timestamp
         使记录 timestamp=气泡起始时刻、extra.completed_at=收尾时刻（对齐 pms）。
 
         注意：不透传 request.params 里的 source/proactive_* 字段——control-input 路径
@@ -3527,7 +3553,7 @@ class JiuWenSwarm:
         if not pending_text:
             return
         extra_fields: dict[str, Any] = {}
-        extra_fields = _with_cross_session_history_metadata(
+        extra_fields = with_cross_session_history_metadata(
             _with_heartbeat_history_metadata(
                 _with_web_agent_template_metadata(
                     extra_fields,
@@ -3537,9 +3563,9 @@ class JiuWenSwarm:
                 ),
                 request.params,
             ),
-            request.params,
+            _cross_session_marker_from_params(request.params),
         ) or {}
-        record_timestamp = _resolve_final_record_timestamp(
+        record_timestamp = resolve_final_record_timestamp(
             event_type="chat.final",
             segment_started_at=segment_started_at,
             extra_fields=extra_fields,
@@ -3558,7 +3584,7 @@ class JiuWenSwarm:
         )
 
     async def process_message_stream(
-            self, request: AgentRequest
+        self, request: AgentRequest
     ) -> AsyncIterator[AgentResponseChunk]:
         """处理流式请求.
 
@@ -3687,6 +3713,16 @@ class JiuWenSwarm:
         # command.goal set history is written only after a successful set inside
         # the DeepAdapter stream path (same success gate as unary process_message).
         params_for_history = request.params if isinstance(request.params, dict) else {}
+        history_channel_metadata = (
+            dict(request.metadata)
+            if isinstance(request.metadata, dict)
+            else None
+        )
+        if history_channel_metadata is not None:
+            history_channel_metadata.pop(
+                TEAM_EXECUTION_CONTEXT_METADATA_KEY,
+                None,
+            )
         if (
             request.req_method != ReqMethod.COMMAND_GOAL
             and _should_record_user_history(params_for_history)
@@ -3700,7 +3736,7 @@ class JiuWenSwarm:
                 content=_history_user_content(params_for_history, query),
                 timestamp=time.time(),
                 extra=_history_user_extra(params_for_history),
-                channel_metadata=request.metadata,
+                channel_metadata=history_channel_metadata,
                 mode=params_for_history.get("mode", "unknown"),
             )
         logger.info(
@@ -3732,11 +3768,38 @@ class JiuWenSwarm:
         # connectors before the agent runs. Always pass a list (never None):
         # empty clears selection when neither side contributes names.
         params = request.params if isinstance(request.params, dict) else {}
+        try:
+            runtime_binding = self._resolve_runtime_binding_for_request(
+                adapter,
+                request,
+                session_id,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            yield AgentResponseChunk(
+                request_id=rid,
+                channel_id=cid,
+                payload={"event_type": "chat.error", "error": str(exc)},
+                is_complete=True,
+            )
+            return
+        reconcile_kwargs: dict[str, Any] = {
+            "model_name": params.get("model_name"),
+            "history_before_request_id": request.request_id,
+        }
+        if runtime_binding is not None:
+            reconcile_kwargs["runtime_binding"] = runtime_binding
+        if params.get("model_selection") is not None:
+            reconcile_kwargs["model_selection"] = params["model_selection"]
+        if "moa_enabled" in params:
+            reconcile_kwargs["moa_enabled"] = params["moa_enabled"]
+        moa_access = getattr(adapter, "moa_access_kwargs", None)
+        if callable(moa_access):
+            reconcile_kwargs.update(moa_access(request))
+        reconcile_kwargs["execution_request"] = request
         await self.reconcile_session_mcp(
             request.session_id,
             compute_chat_send_mcp_needed(params),
-            model_name=params.get("model_name"),
-            history_before_request_id=request.request_id,
+            **reconcile_kwargs,
         )
         # Team 的交互回答走普通流式路径，不经过 deliver_control_input。
         # 与单 Agent 使用同一落盘格式，按原问题的 params.request_id 配对。
@@ -3782,6 +3845,9 @@ class JiuWenSwarm:
         output_phase_metadata: dict[str, Any] = {}
         durable_pending_final_order: dict[str, Any] | None = None
         durable_pending_reasoning_order: dict[str, Any] | None = None
+        # Team 成员的 delta/reasoning 与 leader 交错到达，各自分桶，只被成员自己的
+        # 边界冲刷，避免成员正文被记成 leader 消息、reasoning 错配（见模块说明）。
+        team_member_history = TeamMemberStreamHistory()
         # 这条流是否带过 Goal 事件。Goal 仍 active 时流结束是不发 chat.final 的
         # （见 interface_deep._should_emit_stream_end_chat_final），气泡里的正文
         # 就没人落盘；收尾时按这个标记补一次，只影响 Goal 流。
@@ -3895,7 +3961,7 @@ class JiuWenSwarm:
             })
             if not isinstance(extra_fields, dict):
                 extra_fields = {}
-            extra_fields = _with_cross_session_history_metadata(
+            extra_fields = with_cross_session_history_metadata(
                 _with_heartbeat_history_metadata(
                     _with_web_agent_template_metadata(
                         extra_fields,
@@ -3905,9 +3971,9 @@ class JiuWenSwarm:
                     ),
                     request.params,
                 ),
-                request.params,
+                _cross_session_marker_from_params(request.params),
             ) or {}
-            record_timestamp = _resolve_final_record_timestamp(
+            record_timestamp = resolve_final_record_timestamp(
                 event_type="chat.final",
                 segment_started_at=segment_started_at,
                 extra_fields=extra_fields,
@@ -3928,11 +3994,65 @@ class JiuWenSwarm:
             )
             durable_final_content = pending_text
 
+        async def _persist_team_member_pending_final(
+            member_key: str | None = None,
+            *,
+            completed_at: float | None = None,
+        ) -> None:
+            if member_key is None:
+                pending_items = team_member_history.take_all_pending_finals(completed_at=completed_at)
+            else:
+                item = team_member_history.take_pending_final(member_key, completed_at=completed_at)
+                pending_items = [item] if item is not None else []
+            for item in pending_items:
+                extra_fields = dict(item.extra)
+                record_timestamp = resolve_final_record_timestamp(
+                    event_type="chat.final",
+                    segment_started_at=item.started_at,
+                    extra_fields=extra_fields,
+                )
+                await _run_history_io(
+                    append_history_record,
+                    session_id=session_id,
+                    request_id=rid,
+                    channel_id=cid,
+                    role="assistant",
+                    event_type="chat.final",
+                    content=item.content,
+                    timestamp=record_timestamp,
+                    extra=extra_fields,
+                    mode=request.params.get("mode", "unknown"),
+                )
+
+        async def _note_team_member_stream_event(
+            member_key: str,
+            event_type: str,
+            payload: dict[str, Any],
+            content: str,
+        ) -> bool:
+            """Buffer/flush a teammate frame in its own bucket; return whether to record it."""
+            if event_type == "chat.delta":
+                team_member_history.note_delta(member_key, content, payload)
+                return False
+            if event_type == "chat.reasoning":
+                team_member_history.note_reasoning(member_key, content, payload)
+                return False
+            if event_type in MEMBER_SEGMENT_BOUNDARY_EVENTS:
+                await _persist_team_member_pending_final(member_key)
+            elif event_type == "chat.final":
+                ensure_final_mode_inplace(payload)
+                if content:
+                    team_member_history.discard_text(member_key, final_content=content)
+                else:
+                    await _persist_team_member_pending_final(member_key)
+            return True
+
         async def _persist_input_boundary(payload: dict[str, Any]) -> None:
             # Flush BEFORE writing the user. This is the same ordered boundary
             # the browser receives, so reload cannot merge old/new answers.
             await _persist_pending_final_text(completed_at=payload["timestamp"] / 1000)
             await _persist_pending_reasoning()
+            await _persist_team_member_pending_final(completed_at=payload["timestamp"] / 1000)
             await _run_history_io(
                 append_history_record,
                 session_id=session_id,
@@ -4063,7 +4183,7 @@ class JiuWenSwarm:
                     if pk not in extra_fields and pk in request.params:
                         extra_fields[pk] = request.params[pk]
             extra_fields = _attach_reasoning_content(extra_fields) or {}
-            extra_fields = _with_cross_session_history_metadata(
+            extra_fields = with_cross_session_history_metadata(
                 _with_heartbeat_history_metadata(
                     _with_web_agent_template_metadata(
                         extra_fields,
@@ -4073,7 +4193,7 @@ class JiuWenSwarm:
                     ),
                     request.params,
                 ),
-                request.params,
+                _cross_session_marker_from_params(request.params),
             ) or {}
             await _run_history_io(
                 append_history_record,
@@ -4083,7 +4203,7 @@ class JiuWenSwarm:
                 role="assistant",
                 event_type="chat.final",
                 content=content,
-                timestamp=_resolve_final_record_timestamp(
+                timestamp=resolve_final_record_timestamp(
                     event_type="chat.final",
                     segment_started_at=None,
                     extra_fields=extra_fields,
@@ -4376,7 +4496,22 @@ class JiuWenSwarm:
                                     rid,
                                 )
                                 continue
-                            if et == "chat.delta":
+                            team_member_key = (
+                                team_member_stream_key(data.payload) if is_team_mode else None
+                            )
+                            if team_member_key is not None:
+                                if et == "chat.final":
+                                    final_segment_started_at, final_segment_order = (
+                                        team_member_history.text_segment_start(team_member_key)
+                                    )
+                                record_member_event = await _note_team_member_stream_event(
+                                    team_member_key,
+                                    et,
+                                    data.payload,
+                                    payload_content,
+                                )
+                                should_record = should_record and record_member_event
+                            elif et == "chat.delta":
                                 final_answer_chunks.append(payload_content)
                                 if suppress_a2ui_stream or a2ui_split is not None:
                                     first_a2ui_suppression = not suppress_a2ui_stream
@@ -4518,7 +4653,11 @@ class JiuWenSwarm:
                                             if k not in ("type", "timestamp", "content"):
                                                 extra_fields[k] = v
                                 if et in {"chat.final", "chat.tool_call"}:
-                                    extra_fields = _attach_reasoning_content(extra_fields)
+                                    extra_fields = (
+                                        team_member_history.attach_reasoning(team_member_key, extra_fields)
+                                        if team_member_key is not None
+                                        else _attach_reasoning_content(extra_fields)
+                                    )
                                 # 透传 proactive 标记——刷新页面时前端靠 source 识别卡片
                                 for pk in (
                                     "source",
@@ -4531,7 +4670,7 @@ class JiuWenSwarm:
                                         extra_fields[pk] = request.params[pk]
                                 if not isinstance(extra_fields, dict):
                                     extra_fields = {}
-                                extra_fields = _with_cross_session_history_metadata(
+                                extra_fields = with_cross_session_history_metadata(
                                     _with_heartbeat_history_metadata(
                                         _with_web_agent_template_metadata(
                                             extra_fields,
@@ -4542,9 +4681,9 @@ class JiuWenSwarm:
                                         ),
                                         request.params,
                                     ),
-                                    request.params,
+                                    _cross_session_marker_from_params(request.params),
                                 ) or {}
-                                record_timestamp = _resolve_final_record_timestamp(
+                                record_timestamp = resolve_final_record_timestamp(
                                     event_type=et,
                                     segment_started_at=(
                                         final_segment_started_at if et == "chat.final" else None
@@ -4563,9 +4702,9 @@ class JiuWenSwarm:
                                     extra=extra_fields if extra_fields else None,
                                     mode=request.params.get("mode", "unknown"),
                                 )
-                                if et == "chat.final":
+                                if et == "chat.final" and team_member_key is None:
                                     durable_final_content = str(data.payload.get("content", ""))
-                            if et == "chat.final":
+                            if et == "chat.final" and team_member_key is None:
                                 next_final_content = str(data.payload.get("content", ""))
                                 if next_final_content:
                                     final_answer_content = next_final_content
@@ -4637,7 +4776,20 @@ class JiuWenSwarm:
                             continue
                         if et == "chat.final":
                             ensure_final_mode_inplace(data)
-                        if et == "chat.delta":
+                        team_member_key = team_member_stream_key(data) if is_team_mode else None
+                        if team_member_key is not None:
+                            if et == "chat.final":
+                                final_segment_started_at, _ = team_member_history.text_segment_start(
+                                    team_member_key
+                                )
+                            record_member_event = await _note_team_member_stream_event(
+                                team_member_key,
+                                et,
+                                data,
+                                payload_content,
+                            )
+                            should_record = should_record and record_member_event
+                        elif et == "chat.delta":
                             final_answer_chunks.append(payload_content)
                             if suppress_a2ui_stream or a2ui_split is not None:
                                 first_a2ui_suppression = not suppress_a2ui_stream
@@ -4741,7 +4893,11 @@ class JiuWenSwarm:
                                         if k not in ("type", "timestamp", "content"):
                                             extra_fields[k] = v
                             if et in {"chat.final", "chat.tool_call"}:
-                                extra_fields = _attach_reasoning_content(extra_fields)
+                                extra_fields = (
+                                    team_member_history.attach_reasoning(team_member_key, extra_fields)
+                                    if team_member_key is not None
+                                    else _attach_reasoning_content(extra_fields)
+                                )
                             # 透传 proactive 标记——刷新页面时前端靠 source 识别卡片
                             for pk in (
                                 "source",
@@ -4754,7 +4910,7 @@ class JiuWenSwarm:
                                     extra_fields[pk] = request.params[pk]
                             if not isinstance(extra_fields, dict):
                                 extra_fields = {}
-                            extra_fields = _with_cross_session_history_metadata(
+                            extra_fields = with_cross_session_history_metadata(
                                 _with_heartbeat_history_metadata(
                                     _with_web_agent_template_metadata(
                                         extra_fields,
@@ -4765,9 +4921,9 @@ class JiuWenSwarm:
                                     ),
                                     request.params,
                                 ),
-                                request.params,
+                                _cross_session_marker_from_params(request.params),
                             ) or {}
-                            record_timestamp = _resolve_final_record_timestamp(
+                            record_timestamp = resolve_final_record_timestamp(
                                 event_type=et,
                                 segment_started_at=(
                                     final_segment_started_at if et == "chat.final" else None
@@ -4786,9 +4942,9 @@ class JiuWenSwarm:
                                 extra=extra_fields if extra_fields else None,
                                 mode=request.params.get("mode", "unknown"),
                             )
-                            if et == "chat.final":
+                            if et == "chat.final" and team_member_key is None:
                                 durable_final_content = str(data.get("content", ""))
-                        if et == "chat.final":
+                        if et == "chat.final" and team_member_key is None:
                             next_final_content = str(data.get("content", ""))
                             if next_final_content:
                                 final_answer_content = next_final_content
@@ -5025,6 +5181,12 @@ class JiuWenSwarm:
         *,
         model_name: str | None = None,
         history_before_request_id: str | None = None,
+        execution_request: AgentRequest | None = None,
+        runtime_binding: dict[str, Any] | None = None,
+        moa_enabled: bool | None = None,
+        model_selection: Any = None,
+        moa_can_access: Any = None,
+        retain_moa_snapshot: bool = False,
     ) -> None:
         """Reconcile this session's MCP set to ``needed`` (idempotent diff).
 
@@ -5044,6 +5206,8 @@ class JiuWenSwarm:
             # Adapter doesn't support session-level MCP (e.g. a stub/mock
             # adapter) — session-level enable is a no-op for it.
             return
+        parameters = {}
+        accepts_kwargs = False
         try:
             parameters = inspect.signature(reconcile).parameters
         except (TypeError, ValueError):
@@ -5062,7 +5226,36 @@ class JiuWenSwarm:
                 supported_kwargs["history_before_request_id"] = (
                     history_before_request_id
                 )
+            if execution_request is not None and "execution_request" in parameters:
+                supported_kwargs["execution_request"] = execution_request
+            if "runtime_binding" in parameters or accepts_kwargs:
+                supported_kwargs["runtime_binding"] = runtime_binding
+            if model_selection is not None and ("model_selection" in parameters or accepts_kwargs):
+                supported_kwargs["model_selection"] = model_selection
+            if moa_enabled is not None and ("moa_enabled" in parameters or accepts_kwargs):
+                supported_kwargs["moa_enabled"] = moa_enabled
+            if moa_can_access is not None and ("moa_can_access" in parameters or accepts_kwargs):
+                supported_kwargs["moa_can_access"] = moa_can_access
+            if retain_moa_snapshot and ("retain_moa_snapshot" in parameters or accepts_kwargs):
+                supported_kwargs["retain_moa_snapshot"] = True
         await reconcile(session_id, needed, **supported_kwargs)
+
+    @staticmethod
+    def _resolve_runtime_binding_for_request(
+        adapter: AgentAdapter,
+        request: AgentRequest,
+        session_id: str,
+    ) -> dict[str, Any] | None:
+        """Resolve one chat's runtime before any session-child side effects."""
+        if request.req_method is not ReqMethod.CHAT_SEND:
+            return None
+        resolver = getattr(adapter, "resolve_runtime_binding", None)
+        if not callable(resolver):
+            return None
+        params = request.params if isinstance(request.params, dict) else {}
+        runtime_binding = resolver(session_id, params)
+        request.trusted_runtime_binding = runtime_binding
+        return runtime_binding
 
     def sync_mcp_credentials(self) -> bool:
         """Sync connected MCPs' tokens into os.environ (skill scripts).
@@ -5117,8 +5310,7 @@ class JiuWenSwarm:
         operation: str,
         config_path: str,
     ) -> None:
-        """Propagate a harness package load/unload to all live session adapters.
-        """
+        """Propagate a harness package load/unload to all live session adapters."""
         adapter = self._adapter
         if adapter is None:
             return

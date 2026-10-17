@@ -14,9 +14,18 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 import httpx
 import pytest
 
-from jiuwenswarm.server.runtime.mcp import remote_oauth as oauth
+from jiuwenswarm.common import mcp_remote_oauth as oauth
 
 NAME = "qcc-company"
+
+
+@pytest.fixture(autouse=True)
+def credential_provider(monkeypatch):
+    """Mirror the runtime's credential provider assembly for isolated tests."""
+    from jiuwenswarm.common import external_providers
+    from jiuwenswarm.server.runtime.mcp import credential
+
+    monkeypatch.setitem(external_providers._providers, "mcp_credential", credential)
 
 
 class Provider:

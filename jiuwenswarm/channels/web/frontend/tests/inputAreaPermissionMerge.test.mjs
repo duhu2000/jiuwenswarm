@@ -27,7 +27,10 @@ class MockWebSocket {
 
   send(rawMessage) {
     const request = JSON.parse(rawMessage);
-    if (!['agent_groups.list', 'commands.list', 'skills.list', 'command.compact'].includes(request.method)) {
+    if (![
+      'agent_groups.list', 'commands.list', 'skills.list', 'command.compact',
+      'session.assets.list', 'session.assets.register',
+    ].includes(request.method)) {
       throw new Error(`Unexpected WebSocket request: ${request.method}`);
     }
     let payload = {
@@ -61,6 +64,8 @@ class MockWebSocket {
     } else if (request.method === 'command.compact') {
       slashRequests.push(request);
       payload = { result: 'noop' };
+    } else if (request.method === 'session.assets.list' || request.method === 'session.assets.register') {
+      payload = { items: [] };
     }
     const respond = () => {
       this.onmessage?.({
@@ -116,9 +121,13 @@ after(() => {
 
 const { InputArea } =
   await import('../node_modules/.cache/input-area-permission-merge/components/ChatPanel/InputArea.js');
-const { useChatStore, useSessionStore, useWorkspaceStore, usePlanStore } =
+const { useChatStore, useSessionStore, useWorkspaceStore, usePlanStore, useTeamSelectorStore } =
   await import('../node_modules/.cache/input-area-permission-merge/stores/index.js');
 const { default: i18n } = await import('../node_modules/.cache/input-area-permission-merge/i18n/index.js');
+const { setTeamOrganizationUiEnabled } = await import('../node_modules/.cache/input-area-permission-merge/features/teamOrganization/featureConfig.js');
+const { isMultiModelCollaborationEnabled, setMultiModelCollaborationEnabled } =
+  await import('../node_modules/.cache/input-area-permission-merge/features/multiModelCollaboration/featureConfig.js');
+const { webClient } = await import('../node_modules/.cache/input-area-permission-merge/services/webClient.js');
 
 function byId(id, variant) {
   const selector = `[data-testid="${id}"]${variant === undefined ? '' : `[data-variant="${variant}"]`}`;
@@ -313,6 +322,8 @@ async function mount(
   useChatStore.getState().ensureRuntime(sessionId);
   useChatStore.getState().setActiveSessionId(sessionId);
   const previousWorkspace = useWorkspaceStore.getState();
+  const previousCollaboration = isMultiModelCollaborationEnabled();
+  setMultiModelCollaborationEnabled(false);
   useWorkspaceStore.setState({ workMode: 'work', projects: [], selectedProject: null });
   await i18n.changeLanguage(language);
   const saved = [];
@@ -355,6 +366,7 @@ async function mount(
     useSessionStore.getState().removeRuntime(sessionId);
     usePlanStore.getState().removeRuntime(sessionId);
     useWorkspaceStore.setState(previousWorkspace, true);
+    setMultiModelCollaborationEnabled(previousCollaboration);
   }
 }
 
@@ -562,6 +574,83 @@ test('team hides the permission selector without overwriting the persisted profi
   });
 });
 
+test('actual composer follows organization Team identity; dissolution and disabling restore Owner view and ordinary sending', async () => {
+  const groups = [
+    { id: 'business-planning', displayName: '商业策划专家团', avatar: 'http://localhost/business.png' },
+    { id: 'technology-insight', displayName: '技术洞察专家团', avatar: 'http://localhost/technology.png' },
+    { id: 'software-architecture-design', displayName: '代码架构设计专家团', avatar: 'http://localhost/architecture.png' },
+  ].map((group) => ({ ...group, name: group.id, installed: true, source: 'local', capabilities: { canUse: true } }));
+  const teams = groups.map((group, index) => ({
+    team_id: index === 0 ? 'owner' : `expert-${index}`, team_name: index === 0 ? 'owner' : `expert-${index}`,
+    agent_group_name: group.id, organization_id: 'org', is_owner: index === 0, state: 'paused',
+  }));
+  let listedTeams = teams;
+  const requests = [];
+  const originalRequest = webClient.request;
+  webClient.request = async (method, params) => {
+    requests.push(method);
+    if (method === 'agent_groups.list') return { agentGroups: groups };
+    if (method === 'team.list') return { teams: listedTeams, default_team_id: 'owner' };
+    if (method === 'team.snapshot') return { team_id: params.team_id, members: [], tasks: [] };
+    if (method === 'commands.list') return { commands: [] };
+    if (method === 'skills.list') return { skills: [], plugins: [] };
+    if (method === 'session.assets.list') return { assets: [] };
+    assert.fail(`Unexpected composer request: ${method}`);
+  };
+  let testedSession;
+  try {
+    await mount({ mode: 'team', language: 'zh' }, async ({ sessionId, props, render }) => {
+      testedSession = sessionId;
+      let identity;
+      props.onAgentGroupIdentityChange = (value) => { identity = value; };
+      await act(async () => useSessionStore.getState().setAgentGroupBinding(sessionId, 'business-planning'));
+      await render();
+      assert.equal(byId('chat-panel-agent-group-tag-label').textContent, '商业策划专家团');
+      const ordinaryTag = byId('chat-panel-agent-group-tag').outerHTML;
+      await act(async () => {
+        useTeamSelectorStore.setState({ runtimes: {
+          [sessionId]: { teams, selectedTeamId: 'owner', defaultTeamId: 'owner', loaded: true, loading: false },
+        } });
+        setTeamOrganizationUiEnabled(true);
+      });
+      for (const [index, team] of teams.entries()) {
+        await click(byId('chat-panel-team-select-trigger'));
+        await click(document.querySelector(`[data-team-id="${team.team_id}"]`));
+        assert.equal(byId('chat-panel-agent-group-tag-label').textContent, groups[index].displayName);
+        assert.equal(byId('chat-panel-agent-group-tag').querySelector('img').getAttribute('src'), groups[index].avatar);
+        assert.equal(identity.displayName, groups[index].displayName);
+        assert.equal(identity.avatarUrl, groups[index].avatar);
+        assert.equal(useSessionStore.getState().runtimes[sessionId].agentGroupBinding, 'business-planning');
+      }
+      listedTeams = [{ ...teams[0], organization_id: null }];
+      await act(async () => useTeamSelectorStore.getState().fetchTeams(sessionId));
+      assert.equal(useTeamSelectorStore.getState().runtimes[sessionId].selectedTeamId, 'owner');
+      assert.equal(byId('chat-panel-agent-group-tag').outerHTML, ordinaryTag);
+      await click(byId('chat-panel-team-select-trigger'));
+      assert.equal(document.querySelectorAll('[data-testid="chat-panel-team-select-option"]').length, 1);
+      assert.equal(document.querySelector('[data-team-id="expert-1"]'), null);
+      assert.equal(document.querySelector('[data-team-id="expert-2"]'), null);
+      await click(document.querySelector('[data-team-id="owner"]'));
+      await act(async () => setTeamOrganizationUiEnabled(false));
+      assert.equal(document.querySelector('[data-testid="chat-panel-team-select"]'), null);
+      assert.equal(byId('chat-panel-agent-group-tag').outerHTML, ordinaryTag);
+      assert.equal(identity.displayName, '商业策划专家团');
+      const orgRequestCount = requests.filter((method) => method.startsWith('team.')).length;
+      const sent = [];
+      props.onSubmit = (text) => sent.push(text);
+      await render();
+      await typeInput('普通团队消息');
+      await click(byId('chat-panel-input-send'));
+      assert.deepEqual(sent, ['普通团队消息']);
+      assert.equal(requests.filter((method) => method.startsWith('team.')).length, orgRequestCount);
+    });
+  } finally {
+    setTeamOrganizationUiEnabled(false);
+    if (testedSession) useTeamSelectorStore.getState().removeRuntime(testedSession);
+    webClient.request = originalRequest;
+  }
+});
+
 test('team skills and Expert Teams are mutually exclusive', async () => {
   await mount({ mode: 'team', sessionId: 'new' }, async ({ sessionId }) => {
     await act(async () => useSessionStore.getState().addSelectedSkill(sessionId, 'team-skill-1'));
@@ -642,5 +731,116 @@ test('composer exposes Full-duplex only when idle with no text or attachments', 
     assert.ok(byId('chat-panel-input-attachment-card'));
     assert.equal(!!document.querySelector('[data-testid="test-duplex-action"]'), false, 'attachment hides voice action');
     assert.ok(byId('chat-panel-input-send'));
+  });
+});
+
+test('design landing plus menu only offers file attachment', async () => {
+  await mount({ sessionId: 'new' }, async () => {
+    await act(async () => {
+      useWorkspaceStore.setState({ workMode: 'design' });
+    });
+    await click(byId('chat-panel-input-attach-trigger'));
+    assert.ok(document.querySelector('[data-testid="chat-panel-input-attach-menu-file"]'));
+    for (const id of ['agent', 'skill', 'extension', 'design', 'plan', 'swarmflow', 'goal', 'personal-context']) {
+      assert.equal(
+        document.querySelector(`[data-testid="chat-panel-input-attach-menu-${id}"]`),
+        null,
+        `${id} stays hidden on the design landing`,
+      );
+    }
+  });
+});
+
+test('work landing plus menu still offers more than file attachment', async () => {
+  await mount({ sessionId: 'new' }, async () => {
+    await click(byId('chat-panel-input-attach-trigger'));
+    assert.ok(document.querySelector('[data-testid="chat-panel-input-attach-menu-file"]'));
+    assert.ok(document.querySelector('[data-testid="chat-panel-input-attach-menu-agent"]'));
+  });
+});
+
+for (const workMode of ['design', 'work', 'code']) {
+  for (const enabled of [false, true]) {
+    test(`${workMode} composer respects its routing with a model group and collaboration=${enabled}`, async () => {
+      await mount({ sessionId: 'new' }, async ({ props, render, sessionId }) => {
+        const sent = [];
+        const selection = { type: 'model_group', id: 'saved-group' };
+        props.onSubmit = (...args) => sent.push(args);
+        await act(async () => {
+          useWorkspaceStore.setState({ workMode });
+          useSessionStore.getState().setSelectedModelSelection(sessionId, selection);
+          setMultiModelCollaborationEnabled(enabled);
+        });
+        await render();
+        await typeInput('send this draft');
+        const blocked = workMode !== 'design' && !enabled;
+        assert.equal(byId('chat-panel-input-send').disabled, blocked);
+        await click(byId('chat-panel-input-send'));
+        if (blocked) {
+          await act(async () => byId('chat-panel-input').dispatchEvent(
+            new dom.window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }),
+          ));
+          assert.deepEqual(sent, []);
+          assert.equal(byId('chat-panel-input').textContent, 'send this draft');
+        } else {
+          assert.equal(sent.length, 1);
+          assert.equal(sent[0][0], 'send this draft');
+        }
+        assert.deepEqual(useSessionStore.getState().getRuntime(sessionId).selectedModelSelection, selection);
+      });
+    });
+  }
+}
+
+test('design landing with a saved model group hides stop and refuses a follow-up prompt', async () => {
+  await mount({ sessionId: 'new' }, async ({ props, render, sessionId }) => {
+    const cancelled = [];
+    const sent = [];
+    props.onCancel = () => cancelled.push('cancel');
+    props.onSubmit = (...args) => sent.push(args);
+    props.onInterrupt = () => sent.push('interrupt');
+    props.isProcessing = true;
+    await act(async () => {
+      useWorkspaceStore.setState({ workMode: 'design' });
+      useSessionStore.getState().setSelectedModelSelection(sessionId, { type: 'model_group', id: 'saved-group' });
+      useChatStore.getState().setProcessing(sessionId, true);
+    });
+    await render();
+
+    const editor = byId('chat-panel-input');
+    const send = byId('chat-panel-input-send');
+    assert.equal(send.dataset.variant, 'submitting');
+    assert.equal(send.disabled, true);
+    assert.equal(editor.getAttribute('contenteditable'), 'false');
+    assert.equal(editor.getAttribute('aria-disabled'), 'true');
+    assert.equal(editor.getAttribute('data-placeholder'), i18n.t('chat.placeholder'));
+    assert.notEqual(editor.getAttribute('data-placeholder'), i18n.t('chat.placeholderProcessingQueue'));
+    assert.equal(byId('chat-panel-input-attach-trigger').disabled, true);
+
+    editor.textContent = 'send another prompt';
+    await act(async () => {
+      editor.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
+      editor.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    });
+    await act(async () => {
+      send.click();
+    });
+    assert.deepEqual(cancelled, []);
+    assert.deepEqual(sent, []);
+    assert.deepEqual(useChatStore.getState().getRuntime(sessionId).taskQueue, []);
+  });
+});
+
+test('work landing still offers stop and a follow-up queue while processing', async () => {
+  await mount({ sessionId: 'new' }, async ({ props, render, sessionId }) => {
+    props.isProcessing = true;
+    await act(async () => {
+      useChatStore.getState().setProcessing(sessionId, true);
+    });
+    await render();
+    const editor = byId('chat-panel-input');
+    assert.equal(byId('chat-panel-input-send').dataset.variant, 'stop');
+    assert.equal(editor.getAttribute('data-placeholder'), i18n.t('chat.placeholderProcessingQueue'));
+    assert.equal(editor.getAttribute('contenteditable'), 'true');
   });
 });

@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from jiuwenswarm.server.runtime.mcp import registry
-from jiuwenswarm.server.runtime.mcp import remote_oauth as oauth
+from jiuwenswarm.common import mcp_remote_oauth as oauth
 from jiuwenswarm.server.runtime.mcp.credential import CredentialStore
 from tests.unit_tests.agentserver.mcp.manifest_helpers import write_manifest
 from tests.unit_tests.agentserver.mcp.test_remote_oauth import NAME, Provider, authorize
@@ -101,7 +101,7 @@ async def test_core_registered_transport_initializes_lists_calls_and_refreshes(
     from openjiuwen.core.runner.resources_manager.tool_manager import ToolMgr
 
     from jiuwenswarm.common.mcp_config import build_mcp_server_config
-    from jiuwenswarm.server.runtime.mcp.remote_oauth_transport import (
+    from jiuwenswarm.common.mcp_remote_oauth_transport import (
         OAuthStreamableHttpClient,
     )
 
@@ -272,3 +272,14 @@ def test_generic_cancel_connect_stops_remote_oauth_and_preserves_finished_grant(
         assert manager.grant(NAME) == grant
     finally:
         registry.clear_connect_cancel(NAME)
+
+
+def test_oauth_uses_existing_credential_store_without_migration(setup):
+    manager, _, workspace = setup
+    store = CredentialStore(workspace_dir=workspace)
+    store.save_token(NAME, "QICHACHA_API_KEY", "existing-key")
+    assert manager.store.get_token(NAME, "QICHACHA_API_KEY") == "existing-key"
+    authorize(manager)
+    assert store.get_token(NAME + "-oauth", oauth.GRANT_KEY) is not None
+    restored = oauth.RemoteOAuthManager(workspace)
+    assert restored.grant(NAME) == manager.grant(NAME)
