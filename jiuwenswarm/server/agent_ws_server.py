@@ -9540,7 +9540,10 @@ class AgentWebSocketServer:
                 from jiuwenswarm.server.runtime.mcp.state_store import remove_mcp_record
                 manager = oauth_manager()
                 with manager.lock:
-                    grant = manager.grant(name)
+                    try:
+                        grant = manager.grant(name)
+                    except OAuthError:
+                        grant = {}
                     if not grant or grant.get("oauth_session") == oauth_session:
                         remove_mcp_record(name)
                 return {"type": "connect_failed", "name": name, "code": "MCP_AUTH_FAILED",
