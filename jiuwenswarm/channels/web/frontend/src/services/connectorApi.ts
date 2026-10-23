@@ -145,9 +145,12 @@ interface RawConnectResponse {
   fields?: Record<string, ConnectorCredentialField>;
   step_index?: number;
   steps_total?: number;
+  auth_pending?: boolean;
+  host_oauth?: boolean;
   auth_url?: string | null;
   auth_domain?: string;
   command?: string;
+  flow?: string;
 }
 
 function fromRawConnect(raw: RawConnectResponse): ConnectorConnectResponse {
@@ -173,9 +176,12 @@ function fromRawConnect(raw: RawConnectResponse): ConnectorConnectResponse {
     fields: raw.fields,
     stepIndex: raw.step_index,
     stepsTotal: raw.steps_total,
+    authPending: raw.auth_pending,
+    hostOAuth: raw.host_oauth,
     authUrl: raw.auth_url,
     authDomain: raw.auth_domain,
     command: raw.command,
+    flow: raw.flow,
   };
 }
 
@@ -238,6 +244,15 @@ export const connectorApi = {
   },
   cancelOAuth: (name: string, oauthSession: string) =>
     webRequest('mcp.connect', { name, auth_method: 'oauth_cancel', oauth_session: oauthSession }),
+  startOAuth: async (name: string): Promise<ConnectorConnectResponse> => {
+    const callbackUrl = window.location.origin;
+    const payload = await webRequest<RawConnectResponse>(
+      'mcp.oauth.start',
+      { name, callback_url: callbackUrl },
+      { timeoutMs: 5 * 60 * 1000 },
+    );
+    return fromRawConnect(payload);
+  },
   // 用户在中途放弃连接/授权（误操作想重新走一遍 OAuth，或等太久了）。后端把正在 hold-open 的
   // mcp.connect/mcp.wait_auth 收尾成 cancelled，杀掉挂起的 CLI 授权进程并回滚 connecting 记录。
   // 幂等，连接没在进行中时调用也无副作用。

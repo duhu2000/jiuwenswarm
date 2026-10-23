@@ -177,8 +177,14 @@ modes:
 
 ## 五、生命周期与故障处理
 
+任务完成状态与 Web 执行状态分别收尾：后台组织 turn 结束后，前端关闭对应 Team 本轮的思考与流式输出，不影响其他 Team 正在执行的工作。仅接收消息的 `attach_only` 订阅不会使会话持续显示忙碌；真实任务执行及等待用户输入仍保留忙碌状态。判断汇总是否完成，应查看 Summary Execution 和任务状态，不能只依据某一段回复的 `chat.final`。
+
 专家 Team 创建成功后会进入暂停待命状态，由 Organization 事件唤醒。若启动后入组失败，Launcher 会停止临时 Team。Summary Team 的创建状态与当前 Summary Execution 分开持久化；在开关开启、使用同一 session 和持久化 storage 并重新激活 Team 的前提下，进程重启后会恢复共享实例并重新检查来源是否就绪。
 
 解散 Organization 后，组织临时创建的专家 Team 和共享 Summary Team 停止；Owner Team 保留，可继续聊天或重新组建组织。原本独立存在、后来受邀加入的普通 Team 只解除组织绑定。Web 团队选择器回到 Owner，不再提供已停止的临时专家 Team。解散不会卸载专家团模板，也不会删除历史消息和已写入的交付物，但会删除该组织的任务、验收及汇总执行等组织数据。
 
 排障时重点查看：AgentGroup 扫描日志、专家/汇总 Launcher 日志、Organization 进度事件、Team runtime 状态，以及各 Team 是否持有同一个数据库实例。
+
+## 导入包
+
+导入在保存和安装前校验技能。`skills` 字符串项必须是技能名称，例如 `"docx-pro"`；目录映射使用包内相对路径，例如 `{"dir": "skills/docx-pro", "mode": "all"}`。拒绝 POSIX 和 Windows 绝对路径，包括上传至非 Windows 服务端的 Windows 路径。技能目录必须位于包内并包含 `SKILL.md`。

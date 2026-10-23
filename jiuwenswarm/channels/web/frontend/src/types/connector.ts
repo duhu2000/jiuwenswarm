@@ -126,7 +126,7 @@ export interface ConnectorConnectResponse {
   oauthSession?: string;
   credentialsRequired?: boolean;
   requiredTokens?: string[];
-  credentialKind?: 'token';
+  credentialKind?: 'token' | 'oauth';
   title?: string;
   description?: string;
   docUrl?: string | null;
@@ -140,7 +140,10 @@ export interface ConnectorConnectResponse {
   // auth_required 分支专属字段
   stepIndex?: number;
   stepsTotal?: number;
+  authPending?: boolean;
+  hostOAuth?: boolean;
   authUrl?: string | null;
   authDomain?: string;
   command?: string;
+  flow?: string;
 }

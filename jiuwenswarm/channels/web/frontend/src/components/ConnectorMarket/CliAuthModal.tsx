@@ -29,16 +29,22 @@ interface CliAuthModalProps {
 export function CliAuthModal({ name, initial, onCancel, onConnected }: CliAuthModalProps) {
   const { t } = useTranslation();
   const waitAuth = useConnectorStore((s) => s.waitAuth);
+  const startOAuth = useConnectorStore((s) => s.startOAuth);
   const [step, setStep] = useState(initial);
   const [status, setStatus] = useState<'waiting' | 'error'>('waiting');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [justAdvanced, setJustAdvanced] = useState(false);
   const requestSeqRef = useRef(0);
+  const hostOAuthStartedRef = useRef(false);
   const [retrySeq, setRetrySeq] = useState(0);
   const mountedRef = useRef(false);
   const finishedRef = useRef(false);
   const remoteSessionRef = useRef(step.oauthSession);
   remoteSessionRef.current = step.oauthSession;
+
+  // Host OAuth connectors (Canva) return an explicit backend sentinel; only then
+  // do we call mcp.oauth.start to fetch the real authorize URL.
+  const isHostOAuth = initial.hostOAuth === true;
 
   useEffect(() => {
     mountedRef.current = true;
@@ -57,6 +63,36 @@ export function CliAuthModal({ name, initial, onCancel, onConnected }: CliAuthMo
   }, []);
 
   useEffect(() => {
+    if (isHostOAuth) {
+      if (hostOAuthStartedRef.current) return;
+      hostOAuthStartedRef.current = true;
+      const seq = ++requestSeqRef.current;
+      setStatus('waiting');
+      setErrorMessage(null);
+      void startOAuth(name).then((response) => {
+        if (seq !== requestSeqRef.current) return;
+        if (!response?.flow || !response.authUrl) {
+          setStatus('error');
+          setErrorMessage(t('connectorMarket.cliAuth.error'));
+          return;
+        }
+        window.open(response.authUrl, '_blank', 'noopener,noreferrer');
+        void waitAuth(name, response.stepIndex ?? 0).then((result) => {
+          if (seq !== requestSeqRef.current) return;
+          if (result?.type === 'connected') {
+            onConnected();
+            return;
+          }
+          setStatus('error');
+          setErrorMessage(t('connectorMarket.cliAuth.error'));
+        });
+      }).catch(() => {
+        if (seq !== requestSeqRef.current) return;
+        setStatus('error');
+        setErrorMessage(t('connectorMarket.cliAuth.error'));
+      });
+      return;
+    }
     if (step.authUrl) {
       // 收到响应后自动开窗——不是在用户点击事件里同步触发，可能被浏览器弹窗拦截器挡掉；
       // 挡掉了也没关系，下面渲染的"打开授权链接"按钮可以让用户自己手动开一次。
@@ -88,7 +124,7 @@ export function CliAuthModal({ name, initial, onCancel, onConnected }: CliAuthMo
       setErrorMessage(t('connectorMarket.cliAuth.error'));
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [step, name, retrySeq]);
+  }, [step, name, retrySeq, isHostOAuth, startOAuth, t, waitAuth, onConnected]);
 
   function handleManualOpen() {
     if (step.authUrl) window.open(step.authUrl, '_blank', 'noopener,noreferrer');
@@ -106,6 +142,7 @@ export function CliAuthModal({ name, initial, onCancel, onConnected }: CliAuthMo
   }
 
   async function handleRetry() {
+    hostOAuthStartedRef.current = false;
     if (step.oauthSession) {
       const response = await useConnectorStore.getState().connect(name, 'oauth');
       if (response?.type === 'auth_required') setStep(response);

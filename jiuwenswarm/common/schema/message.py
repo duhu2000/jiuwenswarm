@@ -12,6 +12,11 @@ from jiuwenswarm.common.mode_matrix import deprecate_mode
 logger = logging.getLogger(__name__)
 
 
+# ``chat.send`` 请求携带该 truthy 参数时，仅为已在运行的 Team Session 附加
+# 响应订阅，不提交新输入（gateway / runtime / server 三方共用的协议参数名）。
+TEAM_ATTACH_ONLY_PARAM = "attach_only"
+
+
 class ReqMethod(Enum):
     INITIALIZE = "initialize"
     ACP_TOOL_RESPONSE = "acp.tool_response"
@@ -244,6 +249,7 @@ class ReqMethod(Enum):
     MCP_UNINSTALL = "mcp.uninstall"
     MCP_CONNECT = "mcp.connect"
     MCP_WAIT_AUTH = "mcp.wait_auth"
+    MCP_OAUTH_START = "mcp.oauth.start"
     MCP_CANCEL_CONNECT = "mcp.cancel_connect"
     MCP_DISCONNECT = "mcp.disconnect"
     MCP_REGISTER_CUSTOM = "mcp.register_custom"
@@ -504,6 +510,14 @@ class ReqMethod(Enum):
     RSI_HARNESS_INSTALL = "rsi.harness.install"
     RSI_HARNESS_VERSIONS_LIST = "rsi.harness.versions.list"
     RSI_HARNESS_ROLLBACK = "rsi.harness.rollback"
+
+    # Trajectory diagnosis: the Gateway proxies these to the Worker-hosted service
+    DIAGNOSIS_RUN = "diagnosis.run"
+    DIAGNOSIS_LIST = "diagnosis.list"
+    DIAGNOSIS_GET = "diagnosis.get"
+    DIAGNOSIS_CANCEL = "diagnosis.cancel"
+    DIAGNOSIS_DELETE = "diagnosis.delete"
+    DIAGNOSIS_TTSE_TRIGGER = "diagnosis.ttse.trigger"
 
     # Schedule task management
     SCHEDULE_CHECK_CONFIG = "schedule.check_config"

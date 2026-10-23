@@ -81,6 +81,7 @@ export const SETTINGS_CONFIG_FIELDS: readonly ConfigFieldContract[] = [
   envField('serper_api_key', 'agent', 'text', 'SERPER_API_KEY'),
   envField('jev_openrouter_api_key', 'browser', 'text', 'OPENROUTER_API_KEY'),
   envField('jev_typesafe_api_key', 'browser', 'text', 'TYPESAFE_API_KEY'),
+  envField('jev_custom_api_key', 'browser', 'text', 'JEV_CUSTOM_API_KEY'),
   envField('github_token', 'agent', 'text', 'GITHUB_TOKEN'),
   envField('vision_api_base', 'agent', 'text', 'VISION_API_BASE'),
   envField('vision_api_key', 'agent', 'text', 'VISION_API_KEY'),
@@ -154,6 +155,7 @@ export const SETTINGS_CONFIG_FIELDS: readonly ConfigFieldContract[] = [
   yamlField('a2ui_enabled', 'experimental', 'boolean', 'a2ui.enabled'),
   yamlField('rsi_enabled', 'experimental', 'boolean', 'rsi.enabled'),
   yamlField('trajectory_ui_enabled', 'experimental', 'boolean', 'trajectory_ui.enabled'),
+  yamlField('trajectory_ui_diagnosis_enabled', 'experimental', 'boolean', 'trajectory_ui.diagnosis_enabled'),
   yamlField('team_organization_ui_enabled', 'experimental', 'boolean', 'experimental.team_organization_ui_enabled'),
   yamlField('team_scheduled_dispatch_enabled', 'experimental', 'boolean', 'modes.team.jiuwen_team.dispatch_mode'),
   yamlField(
@@ -161,6 +163,12 @@ export const SETTINGS_CONFIG_FIELDS: readonly ConfigFieldContract[] = [
     'experimental',
     'boolean',
     'modes.team.jiuwen_team.enable_task_verification',
+  ),
+  yamlField(
+    'team_member_messaging_enabled',
+    'experimental',
+    'boolean',
+    'modes.team.jiuwen_team.enable_member_messaging',
   ),
   yamlField('task_full_duplex_enabled', 'experimental', 'boolean', 'experimental.task_full_duplex_enabled'),
   yamlField('task_asr_enabled', 'experimental', 'boolean', 'experimental.task_asr_enabled'),

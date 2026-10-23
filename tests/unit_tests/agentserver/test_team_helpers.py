@@ -6972,7 +6972,7 @@ async def test_broadcast_team_state_snapshot_replays_mirrored_workflow_members(m
     human = by_id["run-running:a-human"]
     assert human["workflow_run_id"] == "run-running"
     assert human["role"] == "human_agent"
-    assert human["mode"] == "human"
+    assert "mode" not in human
     assert "cli_agent" not in human
     # finished run: member_id carries its own run id, terminal node maps to idle
     assert by_id["run-finished:b-claude"]["workflow_run_id"] == "run-finished"
@@ -7162,14 +7162,15 @@ async def test_announce_team_roster_broadcasts_created_members_once(monkeypatch)
 
 
 @pytest.mark.anyio
-async def test_consume_stream_with_query_announces_roster_after_member_tool(monkeypatch):
+@pytest.mark.parametrize("tool_name", ["spawn_teammate", "spawn_expert"])
+async def test_consume_stream_with_query_announces_roster_after_member_tool(monkeypatch, tool_name):
     """A roster-mutating leader tool triggers a roster announcement."""
     broadcasted: list[dict] = []
 
     async def _fake_stream(**kwargs):
         yield SimpleNamespace(
             type="tool_result",
-            payload={"tool_result": {"tool_name": "spawn_teammate", "result": "ok"}},
+            payload={"tool_result": {"tool_name": tool_name, "result": "ok"}},
             role=TeamRole.LEADER,
         )
 
@@ -7249,7 +7250,7 @@ async def test_consume_stream_with_query_announces_roster_after_member_tool(monk
     # The tool result still reaches clients, followed by the roster.
     tool_results = [e for e in broadcasted if e.get("event_type") == "chat.tool_result"]
     assert len(tool_results) == 1
-    assert tool_results[0]["tool_name"] == "spawn_teammate"
+    assert tool_results[0]["tool_name"] == tool_name
     member_events = [e for e in broadcasted if e.get("event_type") == "team.member"]
     assert len(member_events) == 1
     assert member_events[0]["event"]["type"] == "team.member.registered"
@@ -7540,7 +7541,10 @@ def test_workflow_updated_to_team_events_spawned_member_carries_node_identity():
     assert "role" not in codex
     gate = spawned_events["run-1:a-gate"]
     assert gate["role"] == "human_agent"
-    assert gate["mode"] == "human"
+    # ``mode`` must stay absent: the frontend opens the "invite a human" card
+    # on mode == "human", and a workflow human node is an inline question to
+    # the session user, not an invitable roster member.
+    assert "mode" not in gate
     assert "cli_agent" not in gate
     native = spawned_events["run-1:a-native"]
     assert "cli_agent" not in native and "role" not in native
